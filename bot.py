@@ -71,6 +71,32 @@ def _start_health_server(port: int) -> None:
     log.info("Health server listening on port %s", port)
 
 
+# ---------------- POT provider check (yt-dlp YouTube helper) ----------------
+
+def check_pot_provider() -> None:
+    """Log whether the local bgutil PO-token provider responded on 127.0.0.1:4416."""
+    import httpx as _httpx
+
+    def _run():
+        for attempt in range(10):
+            try:
+                r = _httpx.get("http://127.0.0.1:4416/ping", timeout=3)
+                data = r.json()
+                log.info("POT provider OK (version %s)",
+                         data.get("version", "unknown"))
+                return
+            except Exception as e:
+                if attempt == 9:
+                    log.warning(
+                        "POT provider unreachable after retries: %s — "
+                        "YouTube downloads on datacenter IPs may be blocked. "
+                        "Consider adding a cookies.txt file.", e)
+                    return
+                time.sleep(3)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ---------------- keyboards / texts ----------------
 
 def list_kb(tracks: list[dict]) -> InlineKeyboardMarkup:
@@ -374,7 +400,10 @@ MINI_APP_FALLBACK = """<!DOCTYPE html>
     });
     let j = {};
     try { j = await res.json(); } catch (_) {}
-    if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+    if (!res.ok) throw new Error(
+      j.error === "unauthorized"
+        ? "sign in failed — close this app and reopen it via the Telegram button"
+        : (j.error || ("HTTP " + res.status)));
     return j;
   }
 
@@ -465,19 +494,28 @@ def _remember_mini(uid: int, tracks: list[dict], query: str) -> None:
 
 
 def validate_initdata(raw: str) -> dict | None:
-    """HMAC-validate Telegram WebApp initData; returns {'id': ...} or None."""
+    """HMAC-validate Telegram WebApp initData; returns the user dict or None.
+
+    Per https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app:
+    the data-check-string is built from the *URL-decoded* key=value pairs
+    (sorted alphabetically, `hash` excluded) joined with newlines. Hashing the
+    raw urlencoded string never matches when values contain %XX escapes
+    (the `user` field always does), so values must be decoded first.
+    """
     if not raw or "hash=" not in raw:
         return None
-    pairs = [p for p in raw.split("&") if not p.startswith("hash=")]
-    provided = dict(p.split("=", 1) for p in raw.split("&") if "=" in p).get("hash", "")
-    data_check = "\n".join(sorted(pairs))
-    secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
-    calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc, provided):
-        return None
     try:
-        user = json.loads(urllib.parse.unquote(
-            dict(p.split("=", 1) for p in raw.split("&") if "=" in p).get("user", "")))
+        fields = dict(urllib.parse.parse_qsl(raw, keep_blank_values=True))
+        provided = fields.pop("hash", "")
+        if not provided:
+            return None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, provided):
+            log.warning("Mini App initData: hash mismatch")
+            return None
+        user = json.loads(fields.get("user") or "")
         uid = int(user.get("id") or 0)
         return user if uid else None
     except Exception:
@@ -576,6 +614,7 @@ def main():
     port = os.getenv("PORT")
 
     if base and port and port.isdigit():
+        check_pot_provider()
         asyncio.run(_run_webhook_mode(int(port), base.rstrip("/")))
         return
 
@@ -584,6 +623,7 @@ def main():
         _start_health_server(int(health_port))
 
     app = build_app()
+    check_pot_provider()
     log.info("Bot starting (long polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 

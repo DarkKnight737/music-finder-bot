@@ -84,7 +84,10 @@
     });
     let j = {};
     try { j = await res.json(); } catch (_) {}
-    if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+    if (!res.ok) throw new Error(
+      j.error === "unauthorized"
+        ? "sign in failed — close this app and reopen it via the Telegram button"
+        : (j.error || ("HTTP " + res.status)));
     return j;
   }
 

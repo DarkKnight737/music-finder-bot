@@ -16,6 +16,20 @@ log = logging.getLogger("musicbot.dl")
 TEMP = os.path.join(os.path.dirname(__file__), "_downloads")
 os.makedirs(TEMP, exist_ok=True)
 
+# YouTube hard-blocks datacenter IPs (Render etc.) unless the requests carry
+# authenticated cookies. Provide a Netscape-format cookies.txt via the
+# YTDLP_COOKIES env var, a file mounted at /etc/secrets/cookies.txt (Render
+# "Secret Files"), or ./cookies.txt next to downloader.py.
+_COOKIES_CANDIDATES = (
+    os.getenv("YTDLP_COOKIES") or "",
+    "/etc/secrets/cookies.txt",
+    os.path.join(os.path.dirname(__file__), "cookies.txt"),
+)
+COOKIES_FILE = next(
+    (p for p in _COOKIES_CANDIDATES if p and os.path.exists(p)), "")
+if COOKIES_FILE:
+    log.info("Using YouTube cookies: %s", COOKIES_FILE)
+
 _MIN_DUR = 40
 _MAX_DUR = 20 * 60
 _TIME_BUDGET = 150  # seconds for the whole search+download effort
@@ -40,7 +54,10 @@ _ydl_base = {
     "no_warnings": True,
     "socket_timeout": 20,
     "retries": 3,
+    "nocheckcertificate": True,
 }
+if COOKIES_FILE:
+    _ydl_base["cookiefile"] = COOKIES_FILE
 
 
 def _search_sync(query: str, source: str = "youtube") -> list[dict]:
@@ -144,7 +161,12 @@ async def download_best(query: str, notify=None) -> tuple[str, dict]:
                 return await asyncio.to_thread(_download_one_sync, c["url"], clients)
             except Exception as e:
                 errors.append(_short_err(e))
-    raise RuntimeError("; ".join(errors[-2:]) or "download failed")
+
+    msg = "; ".join(errors[-2:]) or "download failed"
+    if not COOKIES_FILE and ("403" in msg or "rate limit" in msg.lower()
+                             or "blocked" in msg.lower()):
+        msg += " — YouTube is blocking this server's IP; add a cookies.txt file"
+    raise RuntimeError(msg)
 
 
 def cleanup(path: str) -> None:
