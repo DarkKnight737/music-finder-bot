@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: music-finder-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+    autoDeploy: true
