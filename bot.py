@@ -1,4 +1,5 @@
 """Telegram music-finder bot: search songs by name, send full MP3s."""
+import asyncio
 import html
 import logging
 import os
@@ -295,33 +296,7 @@ def main():
     port = os.getenv("PORT")
 
     if base and port and port.isdigit():
-        # ---- Cloud (Render): webhook mode, required on free plan --------
-        import hashlib
-        from aiohttp import web as aio_web
-
-        app = build_app()
-        port_i = int(port)
-
-        extra = aio_web.Application()
-
-        async def _healthz(_) -> "aio_web.Response":
-            return aio_web.Response(text="ok")
-
-        extra.router.add_get("/healthz", _healthz)
-
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port_i,
-            url_path=config.BOT_TOKEN.split(":", 1)[0],  # opaque path segment
-            url=base,
-            secret_token=hashlib.sha256(config.BOT_TOKEN.encode()).hexdigest(),
-            webhook_app=extra,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        # Render's health check hits /healthz; Telegram posts updates to
-        # https://<Render-URL>/<path>. Both keep the instance awake.
-        log.info("Webhook server live on port %s (%s)", port_i, base)
+        asyncio.run(_run_webhook_mode(int(port), base.rstrip("/")))
         return
 
     health_port = os.getenv("HEALTH_PORT")
@@ -332,6 +307,62 @@ def main():
     app = build_app()
     log.info("Bot starting (long polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+async def _run_webhook_mode(port: int, base: str) -> None:
+    """Cloud mode: aiohttp webserver that ingests Telegram webhooks.
+
+    Returns 200 instantly, so downloads (10–30 s) never cause Telegram
+    webhook retries; processing continues in the background.
+    """
+    import hashlib
+    from aiohttp import web as aio_web
+
+    app = build_app()
+    bot = app.bot
+    path_seg = config.BOT_TOKEN.split(":", 1)[0]      # opaque URL segment
+    secret = hashlib.sha256(config.BOT_TOKEN.encode()).hexdigest()
+    webhook_url = f"{base}/{path_seg}"
+
+    await app.initialize()
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret,
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+    )
+    await app.start()
+
+    async def ingest(request: "aio_web.Request") -> "aio_web.Response":
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+            return aio_web.Response(status=403)
+        try:
+            update = Update.de_json(await request.json(), bot)
+            if update is not None:
+                asyncio.create_task(app.process_update(update))
+        except Exception:
+            log.exception("bad webhook update")
+        return aio_web.Response()
+
+    async def healthz(_request) -> "aio_web.Response":
+        return aio_web.Response(text="ok")
+
+    server = aio_web.Application()
+    server.router.add_post(f"/{path_seg}", ingest)
+    server.router.add_get("/healthz", healthz)
+
+    runner = aio_web.AppRunner(server)
+    await runner.setup()
+    await aio_web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Webhook server live: %s (port %d)", webhook_url, port)
+
+    stop = asyncio.Event()
+    try:
+        await stop.wait()
+    finally:
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
