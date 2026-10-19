@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Music Finder</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0e1621);
+    --sec: var(--tg-theme-secondary-bg-color, #1c2733);
+    --text: var(--tg-theme-text-color, #e8eef5);
+    --hint: var(--tg-theme-hint-color, #8d99a9);
+    --accent: var(--tg-theme-button-color, #2ea6ff);
+    --accentText: var(--tg-theme-button-text-color, #fff);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 14px 16px 8px; display: flex; align-items: center; gap: 10px;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+  header .tag { font-size: 12px; color: var(--hint); }
+  .searchbar {
+    display: flex; gap: 8px; padding: 8px 12px 12px;
+  }
+  input[type="search"] {
+    flex: 1; padding: 12px 14px; border-radius: 12px; border: none;
+    background: var(--sec); color: var(--text); font-size: 15px; outline: none;
+  }
+  button {
+    border: none; border-radius: 12px; padding: 12px 18px;
+    background: var(--accent); color: var(--accentText); font-size: 15px; font-weight: 600;
+  }
+  button:disabled { opacity: .55; }
+  #status { text-align: center; color: var(--hint); font-size: 13px; padding: 2px 0 10px; min-height: 18px; }
+  .card {
+    background: var(--sec); margin: 8px 10px; padding: 12px 14px;
+    border-radius: 14px; display: flex; align-items: center; gap: 12px;
+  }
+  .card .info { flex: 1; min-width: 0; }
+  .card .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .a { color: var(--hint); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .d { color: var(--hint); font-size: 12px; }
+  .card button { padding: 8px 12px; font-size: 13px; border-radius: 10px; }
+  footer { text-align: center; color: var(--hint); font-size: 12px; padding: 14px 0 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎵 Music Finder</h1>
+  <span class="tag">full MP3 → your chat</span>
+</header>
+
+<div class="searchbar">
+  <input id="q" type="search" placeholder="Song name or artist…"
+         autocomplete="off" autocorrect="off" spellcheck="false">
+  <button id="go">Search</button>
+</div>
+<div id="status"></div>
+<div id="results"></div>
+
+<footer>Results are sent directly into this chat 📎</footer>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status"), resultsEl = $("results");
+
+  tg.ready();
+  tg.expand();
+  tg.setHeaderColor ? tg.setHeaderColor('bg_color') : null;
+
+  const s = (text) => { statusEl.textContent = text; };
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let j = {};
+    try { j = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+    return j;
+  }
+
+  async function search() {
+    const q = $("q").value.trim();
+    if (!q) { s("Type a song name first 🙂"); return; }
+    resultsEl.innerHTML = "";
+    $("go").disabled = true;
+    s("🔎 Searching… (first query after idle may take a bit longer)");
+    try {
+      const r = await api("/api/search", { initData: tg.initData || "", query: q });
+      if (!r.tracks.length) { s("😕 Nothing found — try the exact title."); return; }
+      s(r.tracks.length + " results — tap a card");
+      resultsEl.innerHTML = "";
+      r.tracks.forEach(t => {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const info = document.createElement("div");
+        info.className = "info";
+        const t1 = document.createElement("div"); t1.className = "t";
+        t1.textContent = (t.index + 1) + ". " + t.title;
+        const t2 = document.createElement("div"); t2.className = "a";
+        t2.textContent = t.artist + (t.album ? " · " + t.album : "");
+        const t3 = document.createElement("div"); t3.className = "d";
+        t3.textContent = Math.floor(t.duration / 60) + ":" +
+          String(t.duration % 60).padStart(2, "0");
+        info.append(t1, t2, t3);
+
+        const btn = document.createElement("button");
+        btn.textContent = "♪ Get";
+        btn.onclick = () => send(t, card);
+
+        card.append(info, btn);
+        resultsEl.append(card);
+      });
+    } catch (e) {
+      s("⚠️ " + e.message);
+    } finally {
+      $("go").disabled = false;
+    }
+  }
+
+  async function send(t, card) {
+    const btn = card.querySelector("button");
+    btn.disabled = true;
+    btn.textContent = "…";
+    tg.HapticFeedback.impactOccurred("light");
+    s("⬇️ Fetching full song — watch your chat");
+    try {
+      const r = await api("/api/send",
+        { initData: tg.initData || "", index: t.index });
+      if (r.ok) {
+        btn.textContent = "✓ Sent";
+        s("✅ On its way to your chat!");
+        tg.HapticFeedback.notificationOccurred("success");
+      } else {
+        btn.disabled = false;
+        btn.textContent = "♪ Get";
+        s("⚠️ " + (r.error || "failed"));
+      }
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "♪ Get";
+      s("⚠️ " + e.message);
+    }
+  }
+
+  $("go").addEventListener("click", search);
+  $("q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") search();
+  });
+  // pre-fill with pasted text or startParameter
+  if (tg.initDataUnsafe && tg.initDataUnsafe.start_param) {
+    $("q").value = tg.initDataUnsafe.start_param;
+    search();
+  }
+</script>
+</body>
+</html>

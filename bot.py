@@ -1,12 +1,20 @@
-"""Telegram music-finder bot: search songs by name, send full MP3s."""
+"""Telegram music-finder bot: full MP3s in chat or via the Mini App."""
 import asyncio
+import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import re
 import threading
+import time
+import urllib.parse
+from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                      MenuButtonWebApp, Message, ReplyKeyboardMarkup, Update,
+                      WebAppInfo)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
@@ -15,9 +23,37 @@ import config
 import downloader
 import music_service
 
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("musicbot")
+
+STATIC_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "static"
+
+WELCOME = (
+    "👋 <b>Hi! I'm your Music Finder.</b>\n\n"
+    "🔍 Type any <b>song name</b> — I'll send the <b>full song as MP3</b>.\n\n"
+    "• ⬇️ Full MP3 with proper title/artist\n"
+    "• 📱 Tap <b>Music App</b> (in the menu or the reply keyboard) for the Mini App\n"
+    "• 🎧 If the full track can't be fetched, I fall back to the official "
+    "30-second preview"
+)
+
+
+def esc(s: str) -> str:
+    return html.escape(s or "")
+
+
+def clean_song_title(s: str) -> str:
+    """Strip YouTube junk like '(Official Video)', '(Lyrics)' etc."""
+    return re.sub(
+        r"\s*\((?:official\s*)?(?:video|audio|lyrics?|music\s*video|mv|hd|hq|visualizer)[^)]*\)\s*",
+        "", s or "", flags=re.IGNORECASE).strip()
+
+
+# ---------------- health server (long-polling/cloud ping) ----------------
 
 def _start_health_server(port: int) -> None:
-    """Hugging Face Spaces Docker: containers must listen on their app port."""
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Health(BaseHTTPRequestHandler):
@@ -36,32 +72,8 @@ def _start_health_server(port: int) -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Health server listening on port %s", port)
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("musicbot")
 
-WELCOME = (
-    "👋 <b>Hi! I'm your Music Finder.</b>\n\n"
-    "🔍 Just type any <b>song name</b> (artist + song works best) and I'll find it.\n\n"
-    "What I can do:\n"
-    "• 🎧 Find tracks on Deezer + iTunes\n"
-    "• ⬇️ Send the <b>full song</b> as MP3\n"
-    "• 🔗 Link to the full track\n\n"
-    "Try it: type <code>blinding lights</code>"
-)
-
-
-def esc(s: str) -> str:
-    return html.escape(s or "")
-
-
-def clean_song_title(s: str) -> str:
-    """Strip YouTube junk like '(Official Video)', '(Lyrics)' etc."""
-    return re.sub(
-        r"\s*\((?:official\s*)?(?:video|audio|lyrics?|music\s*video|mv|hd|hq|visualizer)[^)]*\)\s*",
-        "", s or "", flags=re.IGNORECASE).strip()
-
+# ---------------- keyboards / texts ----------------
 
 def list_kb(tracks: list[dict]) -> InlineKeyboardMarkup:
     rows = []
@@ -81,14 +93,13 @@ def list_text(query: str, tracks: list[dict]) -> str:
         d = music_service.fmt_duration(t["duration"])
         lines.append(f"<b>{i + 1}.</b> <b>{esc(t['title'])}</b> "
                      f"— {esc(t['artist'])} [{d}]")
-    lines += ["", "<i>Tap a track → get the full song as MP3 🎵</i>"]
+    lines += ["", "<i>Tap a track to receive the full song as MP3 🎵</i>"]
     return "\n".join(lines)
 
 
 def detail_kb(t: dict, idx: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("⬇️ Full song (MP3)", callback_data=f"full|{idx}")],
-        [InlineKeyboardButton("🎧 30s preview", callback_data=f"dl|{idx}")],
     ]
     if t["link"]:
         rows.append([InlineKeyboardButton("🔗 Full track", url=t["link"])])
@@ -96,9 +107,16 @@ def detail_kb(t: dict, idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_welcome(update, context):
+    w = context.bot_data.get("webapp_url")
+    kb = None
+    if w:
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("🎵 Music App", web_app=WebAppInfo(url=w))]],
+            resize_keyboard=True)
     await update.effective_message.reply_text(
-        WELCOME, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        WELCOME, parse_mode=ParseMode.HTML, reply_markup=kb,
+        disable_web_page_preview=True)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,7 +142,6 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.chat_data["tracks"] = tracks
     context.chat_data["query"] = query
-
     await msg.edit_text(list_text(query, tracks), parse_mode=ParseMode.HTML,
                         reply_markup=list_kb(tracks))
 
@@ -159,7 +176,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parts = data.split("|")
-    if len(parts) != 2 or parts[0] not in ("track", "dl", "full"):
+    if len(parts) != 2 or parts[0] not in ("track", "full"):
         return
     idx = int(parts[1])
 
@@ -177,104 +194,209 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption, parse_mode=ParseMode.HTML, reply_markup=detail_kb(t, idx))
         return
 
-    if parts[0] == "dl":
-        await send_preview(q, t)
-        return
-
     # parts[0] == "full" -> full song as MP3
-    await send_full(q, t)
+    runner = _ChatRunner(context.bot, q.message.chat_id)
+    await run_download_delivery(runner, t)
 
 
-async def send_preview(q, t: dict) -> None:
-    """Send the official 30-second preview."""
-    await q.answer("⏳ Downloading…", show_alert=False)
-    note = await context_msg(q).reply_text("⬇️ Loading preview…")
-    blob = await music_service.download_file(t["preview"])
-    try:
-        await note.delete()
-    except Exception:
-        pass
-    if not blob:
-        await note.edit_text("⚠️ Preview not available — open the full track with the 🔗 button.")
-        return
-    await context_msg(q).reply_audio(
-        audio=blob,
-        title=t["title"][:60],
-        performer=t["artist"][:60],
-        caption=f"🎧 {esc(t['title'])} — {esc(t['artist'])}",
-        parse_mode=ParseMode.HTML,
-    )
+# ---------------- delivery engine (chat buttons + Mini App) ----------------
 
+class _ChatRunner:
+    """Uniform status/audio delivery for callbacks and Mini App requests."""
 
-async def send_full(q, t: dict) -> None:
-    """Search YouTube for the full track, convert to MP3 and send."""
-    chat = context_msg(q)
-    note = await chat.reply_text(
-        "⏳ Getting the full song…\n<i>(usually takes 10–30 seconds)</i>",
-        parse_mode=ParseMode.HTML)
+    def __init__(self, bot, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self._note: Message | None = None
 
-    async def upd(text: str) -> None:
+    async def status(self, text: str) -> None:
+        if self._note is None:
+            self._note = await self.bot.send_message(
+                self.chat_id, text, parse_mode=ParseMode.HTML)
+        else:
+            try:
+                await self._note.edit_text(text)
+            except Exception:
+                pass
+
+    async def status_done(self) -> None:
+        if self._note is None:
+            return
         try:
-            await note.edit_text(text)
+            await self._note.delete()
         except Exception:
             pass
+        self._note = None
 
-    query = f"{t['artist']} {t['title']}".strip()
+    async def audio(self, *, audio_path=None, audio_bytes=None, title,
+                    performer=None, duration=None, caption=None, thumb=None):
+        if audio_path:
+            with open(audio_path, "rb") as fh:
+                await self.bot.send_audio(
+                    chat_id=self.chat_id, audio=fh,
+                    title=title, performer=performer,
+                    duration=duration or None,
+                    caption=caption, parse_mode=ParseMode.HTML,
+                    thumbnail=thumb,
+                    read_timeout=120, write_timeout=600, connect_timeout=60,
+                )
+        elif audio_bytes:
+            await self.bot.send_audio(
+                chat_id=self.chat_id, audio=audio_bytes,
+                title=title, performer=performer,
+                duration=duration or None,
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
+
+
+async def run_download_delivery(runner: _ChatRunner, t: dict,
+                                query_text: str | None = None) -> None:
+    """Full song; on failure fall back to the official 30-second preview."""
+    query = query_text or f"{t['artist']} {t['title']}".strip()
+    await runner.status("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     try:
-        path, info = await downloader.download_best(query, notify=upd)
+        path, info = await downloader.download_best(query, notify=runner.status)
     except Exception as e:
         log.warning("full download failed: %s", e)
-        await upd("⚠️ Couldn't fetch the full version — sending the 30s preview instead…")
+        await runner.status(
+            f"⚠️ Couldn't fetch the full version.\n"
+            f"<i>{esc(str(e)[-180:])}</i>\n"
+            "Sending the official 30-second preview instead…")
         blob = await music_service.download_file(t["preview"])
         if blob:
-            await chat.reply_audio(
-                audio=blob,
+            await runner.audio(
+                audio_bytes=blob,
                 title=t["title"][:60],
                 performer=t["artist"][:60],
                 caption=f"🎧 {esc(t['title'])} — {esc(t['artist'])}",
-                parse_mode=ParseMode.HTML,
             )
         else:
-            await upd("⚠️ Download failed. Try the 🔗 Full track button instead.")
+            await runner.status("⚠️ Preview also unavailable. "
+                                "Try again soon or use the 🔗 Full track button.")
+        await runner.status_done()
         return
 
     try:
         title = clean_song_title(info.get("title") or t["title"])[:60]
         duration = int(info.get("duration") or t["duration"] or 0)
-        caption = (
-            f"🎵 <b>{esc(clean_song_title(title))}</b>\n"
-            f"👤 {esc(t['artist'])}\n"
-            f"⏱ {music_service.fmt_duration(duration)} · full song 🎵"
-        )
+        caption = (f"🎵 <b>{esc(clean_song_title(title))}</b>\n"
+                   f"👤 {esc(t['artist'])}\n"
+                   f"⏱ {music_service.fmt_duration(duration)} · full song 🎵")
         thumb = await music_service.download_file(t.get("thumb") or "")
-        with open(path, "rb") as fh:
-            await chat.reply_audio(
-                audio=fh,
-                title=title,
-                performer=t["artist"][:60],
-                duration=duration or None,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                thumbnail=thumb,
-            )
+        await runner.audio(
+            audio_path=path, title=title,
+            performer=t["artist"][:60] or None,
+            duration=duration or None,
+            caption=caption, thumb=thumb,
+        )
     finally:
         downloader.cleanup(path)
+        await runner.status_done()
+
+
+# ---------------- Mini App (Telegram WebApp) ----------------
+
+MINI_SESSIONS: dict[int, dict] = {}
+
+
+def _remember_mini(uid: int, tracks: list[dict], query: str) -> None:
+    MINI_SESSIONS[uid] = {"tracks": tracks, "query": query, "ts": time.time()}
+    while len(MINI_SESSIONS) > 100:
+        oldest = min(MINI_SESSIONS, key=lambda k: MINI_SESSIONS[k]["ts"])
+        del MINI_SESSIONS[oldest]
+
+
+def validate_initdata(raw: str) -> dict | None:
+    """HMAC-validate Telegram WebApp initData; returns {'id': ...} or None."""
+    if not raw or "hash=" not in raw:
+        return None
+    pairs = [p for p in raw.split("&") if not p.startswith("hash=")]
+    provided = dict(p.split("=", 1) for p in raw.split("&") if "=" in p).get("hash", "")
+    data_check = "\n".join(sorted(pairs))
+    secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, provided):
+        return None
+    try:
+        user = json.loads(urllib.parse.unquote(
+            dict(p.split("=", 1) for p in raw.split("&") if "=" in p).get("user", "")))
+        uid = int(user.get("id") or 0)
+        return user if uid else None
+    except Exception:
+        return None
+
+
+def _mini_handlers(app, aio_web):
+    bot = app.bot
+
+    async def serve_app(_request):
         try:
-            await note.delete()
+            page = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            return aio_web.Response(text=page, content_type="text/html",
+                                    charset="utf-8")
+        except FileNotFoundError:
+            return aio_web.Response(status=404, text="mini app file missing")
+
+    async def api_search(request):
+        try:
+            body = await request.json()
         except Exception:
-            pass
+            return aio_web.json_response({"ok": False, "error": "bad json"}, status=400)
+        user = validate_initdata(body.get("initData") or "")
+        if user is None:
+            return aio_web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        query = (body.get("query") or "").strip()[:120]
+        if not query:
+            return aio_web.json_response({"ok": False, "error": "no query"}, status=400)
+        tracks = await music_service.search_all(query, config.RESULTS_LIMIT)
+        if not tracks:
+            return aio_web.json_response({"ok": True, "tracks": []})
+        _remember_mini(user["id"], tracks, query)
+        return aio_web.json_response({
+            "ok": True,
+            "tracks": [{"index": i, "title": t["title"], "artist": t["artist"],
+                        "album": t["album"], "duration": t["duration"]}
+                       for i, t in enumerate(tracks)],
+        })
+
+    async def api_send(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return aio_web.json_response({"ok": False, "error": "bad json"}, status=400)
+        user = validate_initdata(body.get("initData") or "")
+        if user is None:
+            return aio_web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        session = MINI_SESSIONS.get(user["id"])
+        if not session:
+            return aio_web.json_response({"ok": False, "error": "search first"}, status=400)
+        try:
+            idx = int(body.get("index", 0))
+        except (TypeError, ValueError):
+            return aio_web.json_response({"ok": False, "error": "bad index"}, status=400)
+        tracks = session["tracks"]
+        if not 0 <= idx < len(tracks):
+            return aio_web.json_response({"ok": False, "error": "bad index"}, status=400)
+        t = tracks[idx]
+        runner = _ChatRunner(bot, user["id"])
+        task = asyncio.create_task(run_download_delivery(runner, t))
+
+        def _log_task(fut):
+            if fut.exception():
+                log.error("mini send failed: %s", fut.exception())
+        task.add_done_callback(_log_task)
+        return aio_web.json_response({"ok": True})
+
+    return serve_app, api_search, api_send
 
 
-def context_msg(q) -> object:
-    """Chat the button came from (for sending follow-up messages)."""
-    return q.message
-
+# ---------------- entry points ----------------
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error: %s", context.error)
 
 
-def build_app() -> "Application":
+def build_app() -> Application:
     app = (Application.builder()
            .token(config.BOT_TOKEN)
            .read_timeout(120)
@@ -303,24 +425,19 @@ def main():
     if health_port and health_port.isdigit():
         _start_health_server(int(health_port))
 
-    # ---- Local: long polling ------------------------------------------
     app = build_app()
     log.info("Bot starting (long polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 async def _run_webhook_mode(port: int, base: str) -> None:
-    """Cloud mode: aiohttp webserver that ingests Telegram webhooks.
-
-    Returns 200 instantly, so downloads (10–30 s) never cause Telegram
-    webhook retries; processing continues in the background.
-    """
-    import hashlib
+    """Cloud mode: aiohttp webserver with webhook + Mini App routes."""
     from aiohttp import web as aio_web
 
     app = build_app()
     bot = app.bot
-    path_seg = config.BOT_TOKEN.split(":", 1)[0]      # opaque URL segment
+    app.bot_data["webapp_url"] = f"{base}/app/"
+    path_seg = config.BOT_TOKEN.split(":", 1)[0]
     secret = hashlib.sha256(config.BOT_TOKEN.encode()).hexdigest()
     webhook_url = f"{base}/{path_seg}"
 
@@ -333,23 +450,21 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     )
     await app.start()
 
-    async def ingest(request: "aio_web.Request") -> "aio_web.Response":
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
-            return aio_web.Response(status=403)
-        try:
-            update = Update.de_json(await request.json(), bot)
-            if update is not None:
-                asyncio.create_task(app.process_update(update))
-        except Exception:
-            log.exception("bad webhook update")
-        return aio_web.Response()
-
-    async def healthz(_request) -> "aio_web.Response":
-        return aio_web.Response(text="ok")
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="🎵 Music App",
+                                         web_app=WebAppInfo(url=f"{base}/app/")))
+    except Exception as e:
+        log.warning("menu button not set: %s", e)
 
     server = aio_web.Application()
-    server.router.add_post(f"/{path_seg}", ingest)
-    server.router.add_get("/healthz", healthz)
+    server.router.add_post(f"/{path_seg}", (webhook_ingest := _make_ingest(app, bot, secret)))
+    server.router.add_get("/healthz", lambda _r: aio_web.Response(text="ok"))
+    serve_app, api_search, api_send = _mini_handlers(app, aio_web)
+    server.router.add_get("/app", serve_app)
+    server.router.add_get("/app/", serve_app)
+    server.router.add_post("/api/search", api_search)
+    server.router.add_post("/api/send", api_send)
 
     runner = aio_web.AppRunner(server)
     await runner.setup()
@@ -363,6 +478,22 @@ async def _run_webhook_mode(port: int, base: str) -> None:
         await app.stop()
         await app.shutdown()
         await runner.cleanup()
+
+
+def _make_ingest(app, bot, secret):
+    async def ingest(request) -> "object":
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+            from aiohttp import web as aio_web
+            return aio_web.Response(status=403)
+        try:
+            update = Update.de_json(await request.json(), bot)
+            if update is not None:
+                asyncio.create_task(app.process_update(update))
+        except Exception:
+            log.exception("bad webhook update")
+        from aiohttp import web as aio_web
+        return aio_web.Response()
+    return ingest
 
 
 if __name__ == "__main__":

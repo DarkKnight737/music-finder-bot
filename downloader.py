@@ -1,14 +1,29 @@
-"""Full-song search & download via yt-dlp (YouTube audio)."""
+"""Full-song fetchers.
+
+YouTube via yt-dlp. In 2026 YouTube aggressively blocks datacenter IPs, so the
+scan tries several player clients and can use a local bgutil PO-token
+provider (see Dockerfile) before giving up.
+"""
 import asyncio
 import os
 import shutil
+import time
 import uuid
 
 TEMP = os.path.join(os.path.dirname(__file__), "_downloads")
 os.makedirs(TEMP, exist_ok=True)
 
-_MIN_DUR = 40       # ignore results shorter than this (karaoke clips, intros…)
-_MAX_DUR = 20 * 60  # ignore 1-hour mixes
+_MIN_DUR = 40
+_MAX_DUR = 20 * 60
+_TIME_BUDGET = 150  # seconds for the whole search+download effort
+_SEARCH_CLIENTS = ("default",)
+_DL_CLIENT_CHAIN = (
+    None,                       # yt-dlp's own default handling
+    ("mweb", "tv", "web_safari"),
+    ("android", "ios"),
+)
+
+import yt_dlp  # noqa: E402  (after env prep)
 
 _ydl_base = {
     "noplaylist": True,
@@ -18,12 +33,41 @@ _ydl_base = {
     "retries": 3,
 }
 
+
+def _search_sync(query: str, source: str = "youtube") -> list[dict]:
+    """Blocking: flat search returning candidates."""
+    if source == "youtube":
+        target = f"ytsearch5:{query}"
+    else:
+        target = f"scsearch5:{query}"
+    opts = {**_ydl_base, "extract_flat": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    out = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        dur = e.get("duration") or 0
+        if dur and not (_MIN_DUR <= dur <= _MAX_DUR):
+            continue
+        out.append({
+            "title": e.get("title") or "",
+            "url": e.get("url") or (f"https://www.youtube.com/watch?v={e.get('id')}" if e.get("id") else ""),
+            "duration": int(dur or 0),
+            "uploader": e.get("uploader") or "",
+        })
+    return out
+
+
+async def find_track(query: str, source: str = "youtube") -> list[dict]:
+    return await asyncio.to_thread(_search_sync, query, source)
+
+
 def _ffmpeg() -> str:
     return shutil.which("ffmpeg") or ""
 
 
-def _download_sync(url: str) -> tuple[str, dict]:
-    """Blocking: download best audio as MP3, return (path, metadata)."""
+def _download_one_sync(url: str, clients) -> tuple[str, dict]:
     out = os.path.join(TEMP, f"song_{uuid.uuid4().hex[:12]}.%(ext)s")
     path_base = out.rsplit(".", 1)[0]
     opts = {
@@ -36,9 +80,12 @@ def _download_sync(url: str) -> tuple[str, dict]:
             "preferredquality": "192",
         }],
     }
+    if clients:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": list(clients)},
+        }
     if _ffmpeg():
         opts["ffmpeg_location"] = _ffmpeg()
-    import yt_dlp
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     result = path_base + ".mp3"
@@ -47,49 +94,40 @@ def _download_sync(url: str) -> tuple[str, dict]:
     return result, info
 
 
-def _search_sync(query: str) -> list[dict]:
-    """Blocking: quick flat search, returns candidates [{title,url,duration}]"""
-    import yt_dlp
-    opts = {**_ydl_base, "extract_flat": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-    out = []
-    for e in info.get("entries") or []:
-        if not e:
-            continue
-        dur = e.get("duration") or 0
-        if dur and not (_MIN_DUR <= dur <= _MAX_DUR):
-            continue
-        out.append({
-            "title": e.get("title") or "",
-            "url": e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}",
-            "duration": int(dur or 0),
-            "uploader": e.get("uploader") or "",
-        })
-    return out
-
-
-async def find_track(query: str) -> list[dict]:
-    """Async wrapper: candidates for a query."""
-    return await asyncio.to_thread(_search_sync, query)
+def _short_err(e: Exception) -> str:
+    for line in str(e).splitlines():
+        s = line.strip()
+        if s:
+            return s[:160]
+    return "unknown error"
 
 
 async def download_best(query: str, notify=None) -> tuple[str, dict]:
-    """Search, pick best candidate, download. Caller must delete the file."""
+    """Search YouTube, then try each candidate across client chains."""
     if notify:
         await notify("🔎 Searching for the full track…")
     cands = await find_track(query)
     if not cands:
-        raise RuntimeError("no candidates")
-    errors = []
+        cands = await find_track(query, source="soundcloud")
+    if not cands:
+        raise RuntimeError("no candidates found")
+
+    deadline = time.monotonic() + _TIME_BUDGET
+    errors: list[str] = []
     for c in cands[:3]:
-        if notify:
-            await notify(f"⬇️ Downloading: {c['title'][:60]}…")
-        try:
-            return await asyncio.to_thread(_download_sync, c["url"])
-        except Exception as e:
-            errors.append(str(e))
-    raise RuntimeError(" · ".join(errors[-1:] or ["download failed"]))
+        for clients in _DL_CLIENT_CHAIN:
+            if time.monotonic() > deadline:
+                errors.append("time budget exceeded")
+                break
+            label = c["title"][:60] or c["url"]
+            if notify:
+                tag = f" (client: {','.join(clients)})" if clients else ""
+                await notify(f"⬇️ Downloading: {label}{tag}")
+            try:
+                return await asyncio.to_thread(_download_one_sync, c["url"], clients)
+            except Exception as e:
+                errors.append(_short_err(e))
+    raise RuntimeError("; ".join(errors[-2:]) or "download failed")
 
 
 def cleanup(path: str) -> None:
