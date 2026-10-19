@@ -34,9 +34,7 @@ WELCOME = (
     "👋 <b>Hi! I'm your Music Finder.</b>\n\n"
     "🔍 Type any <b>song name</b> — I'll send the <b>full song as MP3</b>.\n\n"
     "• ⬇️ Full MP3 with proper title/artist\n"
-    "• 📱 Tap <b>Music App</b> (in the menu or the reply keyboard) for the Mini App\n"
-    "• 🎧 If the full track can't be fetched, I fall back to the official "
-    "30-second preview"
+    "• 📱 Tap <b>Music App</b> (in the menu or the reply keyboard) for the Mini App"
 )
 
 
@@ -251,7 +249,7 @@ class _ChatRunner:
 
 async def run_download_delivery(runner: _ChatRunner, t: dict,
                                 query_text: str | None = None) -> None:
-    """Full song; on failure fall back to the official 30-second preview."""
+    """Full song as MP3; on failure just report why (no 30s preview fallback)."""
     query = query_text or f"{t['artist']} {t['title']}".strip()
     await runner.status("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     try:
@@ -259,20 +257,9 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
     except Exception as e:
         log.warning("full download failed: %s", e)
         await runner.status(
-            f"⚠️ Couldn't fetch the full version.\n"
+            "⚠️ Couldn't fetch the full song right now.\n"
             f"<i>{esc(str(e)[-180:])}</i>\n"
-            "Sending the official 30-second preview instead…")
-        blob = await music_service.download_file(t["preview"])
-        if blob:
-            await runner.audio(
-                audio_bytes=blob,
-                title=t["title"][:60],
-                performer=t["artist"][:60],
-                caption=f"🎧 {esc(t['title'])} — {esc(t['artist'])}",
-            )
-        else:
-            await runner.status("⚠️ Preview also unavailable. "
-                                "Try again soon or use the 🔗 Full track button.")
+            "Please try again in a bit, or use the 🔗 Full track link.")
         await runner.status_done()
         return
 
@@ -297,6 +284,177 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
 # ---------------- Mini App (Telegram WebApp) ----------------
 
 MINI_SESSIONS: dict[int, dict] = {}
+
+# In-container the page is served from static/index.html. This embedded copy
+# is used when that file is missing (e.g. the deploy repo lacks the static
+# folder), so the Mini App can never 404.
+MINI_APP_FALLBACK = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Music Finder</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0e1621);
+    --sec: var(--tg-theme-secondary-bg-color, #1c2733);
+    --text: var(--tg-theme-text-color, #e8eef5);
+    --hint: var(--tg-theme-hint-color, #8d99a9);
+    --accent: var(--tg-theme-button-color, #2ea6ff);
+    --accentText: var(--tg-theme-button-text-color, #fff);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 14px 16px 8px; display: flex; align-items: center; gap: 10px;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+  header .tag { font-size: 12px; color: var(--hint); }
+  .searchbar {
+    display: flex; gap: 8px; padding: 8px 12px 12px;
+  }
+  input[type="search"] {
+    flex: 1; padding: 12px 14px; border-radius: 12px; border: none;
+    background: var(--sec); color: var(--text); font-size: 15px; outline: none;
+  }
+  button {
+    border: none; border-radius: 12px; padding: 12px 18px;
+    background: var(--accent); color: var(--accentText); font-size: 15px; font-weight: 600;
+  }
+  button:disabled { opacity: .55; }
+  #status { text-align: center; color: var(--hint); font-size: 13px; padding: 2px 0 10px; min-height: 18px; }
+  .card {
+    background: var(--sec); margin: 8px 10px; padding: 12px 14px;
+    border-radius: 14px; display: flex; align-items: center; gap: 12px;
+  }
+  .card .info { flex: 1; min-width: 0; }
+  .card .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .a { color: var(--hint); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .d { color: var(--hint); font-size: 12px; }
+  .card button { padding: 8px 12px; font-size: 13px; border-radius: 10px; }
+  footer { text-align: center; color: var(--hint); font-size: 12px; padding: 14px 0 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎵 Music Finder</h1>
+  <span class="tag">full MP3 → your chat</span>
+</header>
+
+<div class="searchbar">
+  <input id="q" type="search" placeholder="Song name or artist…"
+         autocomplete="off" autocorrect="off" spellcheck="false">
+  <button id="go">Search</button>
+</div>
+<div id="status"></div>
+<div id="results"></div>
+
+<footer>Results are sent directly into this chat 📎</footer>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status"), resultsEl = $("results");
+
+  tg.ready();
+  tg.expand();
+  tg.setHeaderColor ? tg.setHeaderColor('bg_color') : null;
+
+  const s = (text) => { statusEl.textContent = text; };
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let j = {};
+    try { j = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+    return j;
+  }
+
+  async function search() {
+    const q = $("q").value.trim();
+    if (!q) { s("Type a song name first 🙂"); return; }
+    resultsEl.innerHTML = "";
+    $("go").disabled = true;
+    s("🔎 Searching… (first query after idle may take a bit longer)");
+    try {
+      const r = await api("/api/search", { initData: tg.initData || "", query: q });
+      if (!r.tracks.length) { s("😕 Nothing found — try the exact title."); return; }
+      s(r.tracks.length + " results — tap a card");
+      resultsEl.innerHTML = "";
+      r.tracks.forEach(t => {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const info = document.createElement("div");
+        info.className = "info";
+        const t1 = document.createElement("div"); t1.className = "t";
+        t1.textContent = (t.index + 1) + ". " + t.title;
+        const t2 = document.createElement("div"); t2.className = "a";
+        t2.textContent = t.artist + (t.album ? " · " + t.album : "");
+        const t3 = document.createElement("div"); t3.className = "d";
+        t3.textContent = Math.floor(t.duration / 60) + ":" +
+          String(t.duration % 60).padStart(2, "0");
+        info.append(t1, t2, t3);
+
+        const btn = document.createElement("button");
+        btn.textContent = "♪ Get";
+        btn.onclick = () => send(t, card);
+
+        card.append(info, btn);
+        resultsEl.append(card);
+      });
+    } catch (e) {
+      s("⚠️ " + e.message);
+    } finally {
+      $("go").disabled = false;
+    }
+  }
+
+  async function send(t, card) {
+    const btn = card.querySelector("button");
+    btn.disabled = true;
+    btn.textContent = "…";
+    tg.HapticFeedback.impactOccurred("light");
+    s("⬇️ Fetching full song — watch your chat");
+    try {
+      const r = await api("/api/send",
+        { initData: tg.initData || "", index: t.index });
+      if (r.ok) {
+        btn.textContent = "✓ Sent";
+        s("✅ On its way to your chat!");
+        tg.HapticFeedback.notificationOccurred("success");
+      } else {
+        btn.disabled = false;
+        btn.textContent = "♪ Get";
+        s("⚠️ " + (r.error || "failed"));
+      }
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "♪ Get";
+      s("⚠️ " + e.message);
+    }
+  }
+
+  $("go").addEventListener("click", search);
+  $("q").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") search();
+  });
+  // pre-fill with pasted text or startParameter
+  if (tg.initDataUnsafe && tg.initDataUnsafe.start_param) {
+    $("q").value = tg.initDataUnsafe.start_param;
+    search();
+  }
+</script>
+</body>
+</html>"""
 
 
 def _remember_mini(uid: int, tracks: list[dict], query: str) -> None:
@@ -332,10 +490,10 @@ def _mini_handlers(app, aio_web):
     async def serve_app(_request):
         try:
             page = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-            return aio_web.Response(text=page, content_type="text/html",
-                                    charset="utf-8")
         except FileNotFoundError:
-            return aio_web.Response(status=404, text="mini app file missing")
+            page = MINI_APP_FALLBACK
+        return aio_web.Response(text=page, content_type="text/html",
+                                charset="utf-8")
 
     async def api_search(request):
         try:
@@ -461,6 +619,7 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     server.router.add_post(f"/{path_seg}", (webhook_ingest := _make_ingest(app, bot, secret)))
     server.router.add_get("/healthz", lambda _r: aio_web.Response(text="ok"))
     serve_app, api_search, api_send = _mini_handlers(app, aio_web)
+    server.router.add_get("/", serve_app)
     server.router.add_get("/app", serve_app)
     server.router.add_get("/app/", serve_app)
     server.router.add_post("/api/search", api_search)
@@ -470,6 +629,7 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     await runner.setup()
     await aio_web.TCPSite(runner, "0.0.0.0", port).start()
     log.info("Webhook server live: %s (port %d)", webhook_url, port)
+    log.info("Mini App served at %s/app/ and %s/", base, base)
 
     stop = asyncio.Event()
     try:

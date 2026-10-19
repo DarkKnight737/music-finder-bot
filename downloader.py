@@ -5,10 +5,13 @@ scan tries several player clients and can use a local bgutil PO-token
 provider (see Dockerfile) before giving up.
 """
 import asyncio
+import logging
 import os
 import shutil
 import time
 import uuid
+
+log = logging.getLogger("musicbot.dl")
 
 TEMP = os.path.join(os.path.dirname(__file__), "_downloads")
 os.makedirs(TEMP, exist_ok=True)
@@ -17,10 +20,16 @@ _MIN_DUR = 40
 _MAX_DUR = 20 * 60
 _TIME_BUDGET = 150  # seconds for the whole search+download effort
 _SEARCH_CLIENTS = ("default",)
+# Client chains tried in order. NOTE: the "android" client is broken in
+# yt-dlp >= 2025 and "ios" requires PO tokens it can't always get, so they
+# waste the whole time budget on Render. These chains are all viable as of
+# yt-dlp 2026.08 on datacenter IPs (bgutil PO provider covers the web-based
+# clients, and web_safari/tv work without tokens).
 _DL_CLIENT_CHAIN = (
-    None,                       # yt-dlp's own default handling
-    ("mweb", "tv", "web_safari"),
-    ("android", "ios"),
+    None,                       # yt-dlp's defaults (visionos + web)
+    ("web_safari",),
+    ("tv", "tv_simply"),
+    ("mweb",),
 )
 
 import yt_dlp  # noqa: E402  (after env prep)
@@ -103,12 +112,20 @@ def _short_err(e: Exception) -> str:
 
 
 async def download_best(query: str, notify=None) -> tuple[str, dict]:
-    """Search YouTube, then try each candidate across client chains."""
+    """Search YouTube (then SoundCloud), try each candidate across client chains."""
     if notify:
         await notify("🔎 Searching for the full track…")
-    cands = await find_track(query)
+    cands: list[dict] = []
+    try:
+        cands = await find_track(query)
+    except Exception as e:
+        # A failed search must not abort everything — SoundCloud is next.
+        log.warning("youtube search failed: %s", e)
     if not cands:
-        cands = await find_track(query, source="soundcloud")
+        try:
+            cands = await find_track(query, source="soundcloud")
+        except Exception as e:
+            log.warning("soundcloud search failed: %s", e)
     if not cands:
         raise RuntimeError("no candidates found")
 

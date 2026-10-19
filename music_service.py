@@ -76,7 +76,7 @@ async def search_all(query: str, limit_per_source: int = 10) -> list[dict]:
     seen, merged = set(), []
     for t in dz + it:
         key = (t["artist"].lower(), t["title"].lower())
-        if key in seen or not t["preview"]:
+        if key in seen or not t["title"]:
             continue
         seen.add(key)
         merged.append(t)
