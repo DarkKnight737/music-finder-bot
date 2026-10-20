@@ -1,8 +1,11 @@
 """Full-song fetchers.
 
-YouTube via yt-dlp. In 2026 YouTube aggressively blocks datacenter IPs, so the
-scan tries several player clients and can use a local bgutil PO-token
-provider (see Dockerfile) before giving up.
+Primary: YouTube via yt-dlp. In 2026 YouTube aggressively blocks datacenter
+IPs, so the scan tries several player clients, can use a local bgutil PO-token
+provider (see Dockerfile) and benefits enormously from a cookies.txt.
+
+Fallback: SoundCloud — datacenter-IP friendly. DRM-protected official uploads
+are skipped automatically; metadata-verified full re-uploads are accepted.
 """
 import asyncio
 import logging
@@ -10,6 +13,8 @@ import os
 import shutil
 import time
 import uuid
+from difflib import SequenceMatcher
+import re
 
 log = logging.getLogger("musicbot.dl")
 
@@ -33,7 +38,6 @@ if COOKIES_FILE:
 _MIN_DUR = 40
 _MAX_DUR = 20 * 60
 _TIME_BUDGET = 150  # seconds for the whole search+download effort
-_SEARCH_CLIENTS = ("default",)
 # Client chains tried in order. NOTE: the "android" client is broken in
 # yt-dlp >= 2025 and "ios" requires PO tokens it can't always get, so they
 # waste the whole time budget on Render. These chains are all viable as of
@@ -60,12 +64,25 @@ if COOKIES_FILE:
     _ydl_base["cookiefile"] = COOKIES_FILE
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _title_sim(a: str, b: str) -> float:
+    an, bn = _norm(a), _norm(b)
+    if not an or not bn:
+        return 0.0
+    if an == bn or an in bn or bn in an:
+        return 1.0
+    return SequenceMatcher(None, an, bn).ratio()
+
+
 def _search_sync(query: str, source: str = "youtube") -> list[dict]:
     """Blocking: flat search returning candidates."""
     if source == "youtube":
         target = f"ytsearch5:{query}"
     else:
-        target = f"scsearch5:{query}"
+        target = f"scsearch8:{query}"
     opts = {**_ydl_base, "extract_flat": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=False)
@@ -93,7 +110,8 @@ def _ffmpeg() -> str:
     return shutil.which("ffmpeg") or ""
 
 
-def _download_one_sync(url: str, clients) -> tuple[str, dict]:
+def _download_one_sync(url: str, clients,
+                       source: str = "youtube") -> tuple[str, dict]:
     out = os.path.join(TEMP, f"song_{uuid.uuid4().hex[:12]}.%(ext)s")
     path_base = out.rsplit(".", 1)[0]
     opts = {
@@ -106,10 +124,11 @@ def _download_one_sync(url: str, clients) -> tuple[str, dict]:
             "preferredquality": "192",
         }],
     }
-    if clients:
-        opts["extractor_args"] = {
-            "youtube": {"player_client": list(clients)},
-        }
+    if source == "youtube":
+        if clients:
+            opts["extractor_args"] = {
+                "youtube": {"player_client": list(clients)},
+            }
     if _ffmpeg():
         opts["ffmpeg_location"] = _ffmpeg()
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -128,23 +147,19 @@ def _short_err(e: Exception) -> str:
     return "unknown error"
 
 
-async def download_best(query: str, notify=None) -> tuple[str, dict]:
-    """Search YouTube (then SoundCloud), try each candidate across client chains."""
+# ---------------- YouTube (primary) ----------------
+
+async def _try_youtube(query: str, notify=None) -> tuple[str, dict] | list[str]:
+    """Returns (path, info) or the list of accumulated error strings."""
     if notify:
-        await notify("🔎 Searching for the full track…")
-    cands: list[dict] = []
+        await notify("🔎 Searching YouTube for the full track…")
     try:
         cands = await find_track(query)
     except Exception as e:
-        # A failed search must not abort everything — SoundCloud is next.
         log.warning("youtube search failed: %s", e)
+        return [f"search failed: {_short_err(e)}"]
     if not cands:
-        try:
-            cands = await find_track(query, source="soundcloud")
-        except Exception as e:
-            log.warning("soundcloud search failed: %s", e)
-    if not cands:
-        raise RuntimeError("no candidates found")
+        return ["no YouTube results"]
 
     deadline = time.monotonic() + _TIME_BUDGET
     errors: list[str] = []
@@ -158,13 +173,96 @@ async def download_best(query: str, notify=None) -> tuple[str, dict]:
                 tag = f" (client: {','.join(clients)})" if clients else ""
                 await notify(f"⬇️ Downloading: {label}{tag}")
             try:
-                return await asyncio.to_thread(_download_one_sync, c["url"], clients)
+                return await asyncio.to_thread(
+                    _download_one_sync, c["url"], clients, "youtube")
             except Exception as e:
                 errors.append(_short_err(e))
+    return errors
+
+
+# ---------------- SoundCloud (datacenter-IP friendly fallback) ----------------
+
+def _sc_filter_ok(c: dict, title: str, artist: str, duration) -> bool:
+    """A re-upload may only stand in for the real thing when it's
+    metadata-verified: same title, and artist or duration corroborates it."""
+    if _title_sim(c.get("title"), title) < 0.6:
+        return False
+    if duration:
+        if c.get("duration"):
+            if abs(c["duration"] - int(duration)) > 40:
+                return False
+        elif artist:
+            return _title_sim(c.get("uploader"), artist) >= 0.6
+    return True
+
+
+async def _try_soundcloud(query: str, notify=None, *, title: str = "",
+                          artist: str = "", duration=None
+                          ) -> tuple[str, dict] | list[str]:
+    if not title:
+        # without metadata we can't vouch for a re-upload at all
+        return ["no metadata for soundcloud fallback"]
+    errors: list[str] = []
+    if notify:
+        await notify("🔎 Checking SoundCloud for the full track…")
+    try:
+        cands = await find_track(query, source="soundcloud")
+    except Exception as e:
+        log.warning("soundcloud search failed: %s", e)
+        return [f"soundcloud search failed: {_short_err(e)}"]
+    verified = [c for c in cands
+                if _sc_filter_ok(c, title, artist, duration)]
+    if not verified:
+        return ["no matching soundcloud re-upload"]
+    deadline = time.monotonic() + 60
+    for c in verified[:2]:
+        if time.monotonic() > deadline:
+            errors.append("soundcloud time budget exceeded")
+            break
+        if notify:
+            await notify(
+                f"⬇️ Downloading: {(c['title'] or '')[:60]}"
+                f"{' — ' + c.get('uploader', '')[:24] if c.get('uploader') else ''}")
+        try:
+            return await asyncio.to_thread(
+                _download_one_sync, c["url"], None, "soundcloud")
+        except Exception as e:
+            errors.append(_short_err(e))
+    return errors
+
+
+# ---------------- entry point ----------------
+
+async def download_best(query: str, notify=None, *, title: str | None = None,
+                        artist: str | None = None,
+                        duration: int | None = None) -> tuple[str, dict]:
+    """Search+download a full song. YouTube first (fastest, best catalog),
+    then metadata-verified SoundCloud re-uploads when YouTube blocks the
+    server's IP (typical on Render without cookies).
+    """
+    if notify:
+        await notify("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
+    title = title or query
+
+    errors: list[str] = []
+    for attempt in (_try_youtube,
+                    lambda q, n: _try_soundcloud(
+                        q, n, title=title, artist=artist or "", duration=duration)):
+        try:
+            got = await attempt(query, notify)
+        except Exception as e:
+            log.exception("fetch attempt failed")
+            errors.append(_short_err(e))
+            continue
+        if isinstance(got, tuple):
+            return got
+        errors.extend(got or [])
 
     msg = "; ".join(errors[-2:]) or "download failed"
-    if not COOKIES_FILE and ("403" in msg or "rate limit" in msg.lower()
-                             or "blocked" in msg.lower()):
+    low = [e.lower() for e in errors]
+    if not COOKIES_FILE and any(
+            m in e for e in low for m in ("403", "rate limit", "blocked",
+                                          "not a bot", "sign in")):
         msg += " — YouTube is blocking this server's IP; add a cookies.txt file"
     raise RuntimeError(msg)
 
