@@ -147,6 +147,21 @@ def _short_err(e: Exception) -> str:
     return "unknown error"
 
 
+# YouTube's "your IP is not trusted" signature. When it appears once, every
+# other player client / candidate will hit it too — so detect it and move on
+# to SoundCloud instead of grinding through the whole matrix (~60–90s wasted).
+_BLOCK_SIGS = (
+    "sign in to confirm", "confirm you're not a bot",
+    "confirm you are not a bot", "use --cookies",
+    "cookies for the authentication", "pass cookies",
+)
+
+
+def _ip_blocked(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(sig in s for sig in _BLOCK_SIGS)
+
+
 # ---------------- YouTube (primary) ----------------
 
 async def _try_youtube(query: str, notify=None) -> tuple[str, dict] | list[str]:
@@ -177,6 +192,14 @@ async def _try_youtube(query: str, notify=None) -> tuple[str, dict] | list[str]:
                     _download_one_sync, c["url"], clients, "youtube")
             except Exception as e:
                 errors.append(_short_err(e))
+                if _ip_blocked(e):
+                    # Every player client will hit the same wall — don't burn
+                    # the whole matrix on it (Render without cookies).
+                    if notify:
+                        await notify(
+                            "🛑 YouTube refuses this server's IP — "
+                            "switching sources…")
+                    return errors
     return errors
 
 
@@ -215,7 +238,7 @@ async def _try_soundcloud(query: str, notify=None, *, title: str = "",
     if not verified:
         return ["no matching soundcloud re-upload"]
     deadline = time.monotonic() + 60
-    for c in verified[:2]:
+    for c in verified[:3]:
         if time.monotonic() > deadline:
             errors.append("soundcloud time budget exceeded")
             break
@@ -236,22 +259,33 @@ async def _try_soundcloud(query: str, notify=None, *, title: str = "",
 async def download_best(query: str, notify=None, *, title: str | None = None,
                         artist: str | None = None,
                         duration: int | None = None) -> tuple[str, dict]:
-    """Search+download a full song. YouTube first (fastest, best catalog),
-    then metadata-verified SoundCloud re-uploads when YouTube blocks the
-    server's IP (typical on Render without cookies).
+    """Search+download a full song.
+
+    Source order: with a cookies.txt, YouTube goes first (full quality).
+    Without one, SoundCloud goes first on datacenter IPs (YouTube only ever
+    answers "Sign in to confirm you're not a bot" there) and YouTube serves
+    as the fallback — it also fast-bails on the first bot-block error so we
+    reach the song instead of grinding a 12-attempt matrix.
     """
     if notify:
         await notify("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     title = title or query
 
+    order = ("youtube", "soundcloud") if COOKIES_FILE else ("soundcloud", "youtube")
+    if COOKIES_FILE and notify:
+        await notify("🍪 Using YouTube cookies for the best quality…")
+
+    attempts = {
+        "youtube": lambda: _try_youtube(query, notify),
+        "soundcloud": lambda: _try_soundcloud(
+            query, notify, title=title, artist=artist or "", duration=duration),
+    }
     errors: list[str] = []
-    for attempt in (_try_youtube,
-                    lambda q, n: _try_soundcloud(
-                        q, n, title=title, artist=artist or "", duration=duration)):
+    for name in order:
         try:
-            got = await attempt(query, notify)
+            got = await attempts[name]()
         except Exception as e:
-            log.exception("fetch attempt failed")
+            log.exception("%s attempt failed", name)
             errors.append(_short_err(e))
             continue
         if isinstance(got, tuple):
