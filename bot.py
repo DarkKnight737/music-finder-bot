@@ -775,6 +775,32 @@ def _mini_handlers(app, aio_web):
         _DIAG_LAST[0] = now
         q = (request.query.get("q") or "shape of you ed sheeran")[:100]
         started = time.time()
+
+        def _done(payload):
+            payload["seconds"] = round(time.time() - started, 1)
+            return aio_web.json_response(payload)
+
+        src = (request.query.get("src") or "all").strip().lower()
+        if src in ("youtube", "saavn", "soundcloud", "audius"):
+            if src == "youtube":
+                got = await downloader._try_youtube(q)
+            elif src == "soundcloud":
+                got = await downloader._try_soundcloud(
+                    q, title=q, artist="")
+            elif src == "audius":
+                got = await downloader._try_audius(
+                    q, title=q, artist="")
+            else:
+                got = await downloader._try_saavn(q, title=q)
+            if isinstance(got, tuple):
+                try:
+                    os.remove(got[0])
+                except OSError:
+                    pass
+                return _done({"ok": True, "source": src,
+                              "title": (got[1].get("title") or "")[:60]})
+            return _done({"ok": False, "source": src, "errors": (got or [])[:6]})
+
         try:
             path, info = await downloader.download_best(
                 q, notify=None, title=q, artist="", duration=None)
