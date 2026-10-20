@@ -112,4 +112,31 @@ Open `https://<app>.onrender.com/diag` in a browser. It reports:
 - `cookies` — whether a YouTube cookies.txt was found (the most reliable
   fix for datacenter-IP download blocks),
 - `proxy` — whether yt-dlp is routed via `YTDLP_PROXY`,
-- `yt_dlp`, `ffmpeg` — versions / presence. |
+- `yt_dlp`, `ffmpeg` — versions / presence.
+
+## Deep probe: /diag/sources
+
+Try the exact download pipeline the bot uses, on the server itself:
+
+```
+curl "https://<app>.onrender.com/diag/sources" -H "X-Render-Secret: <BOT_TOKEN>"
+```
+
+- No query  → runs the full fallback chain (default: "shape of you ed sheeran")
+  and answers `{"ok": true, "source": "<which one delivered>", "seconds": ...}`.
+- `?q=<anything>` — probe a custom query.
+- `?src=youtube|saavn|soundcloud|audius&q=...` — run ONLY that source and get
+  its raw error list (rate-limited to one probe per 20 s; header value is the
+  plain `BOT_TOKEN` or its sha256).
+
+Handy facts learned on the live deployment:
+- YouTube extraction now needs a **JavaScript runtime** (deno/node). The Docker
+  image ships one (node, for the PO-token provider) and `downloader.py` wires
+  it automatically — without it you get
+  "The page needs to be reloaded / Requested format is not available" on every
+  client, even with valid cookies.
+- From a Render datacenter IP, YouTube still requires **valid** cookies
+  (`Sign in to confirm you're not a bot` otherwise). Cookies exported from a
+  browser session can be silently rotated/invalidated by Google within
+  minutes — if `/diag/sources?src=youtube` shows that error *with* cookies
+  set, re-export a fresh `cookies.txt` right after logging in.
