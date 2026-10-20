@@ -40,47 +40,102 @@ Render as the `BOT_TOKEN` env var; on your laptop it's read from
 - URL: `https://<app>.onrender.com/app/`
 - Search → tap **♪ Get** → the MP3 lands in your chat (same engine as chat).
 
-## The quick fix for "confirm you're not a bot"
+## Every way to fix "Sign in to confirm you're not a bot"
 
-That error means YouTube refuses downloads from hosted server IPs. Two
-settings fix it — set either one, then redeploy:
+YouTube refuses downloads from *datacenter* IPs (Render, AWS, GCP…).
+Direct yt-dlp on Render **cannot work without credentials or a trusted
+exit IP** — PO tokens alone are not enough (bgutil's own README says so).
+All viable methods, most effective first:
 
-**Option A — YouTube cookies (most reliable):**
-1. Install the browser extension *Get cookies.txt LOCALLY* (Chrome/Firefox).
-2. On youtube.com, while signed in, export cookies in **Netscape format**.
-3. On your PC, run the helper in this folder (it finds the file in
-   Downloads/Desktop automatically, validates it, and writes the exact
-   value to `_YTDLP_COOKIES_VALUE.txt`):
+### 1. YouTube cookies — free, by far the most reliable ✅
+
+Your own YouTube login travels with every request, so YouTube's IP
+gate stops applying. Set up once (~2 minutes):
+
+1. Install the browser extension *Get cookies.txt LOCALLY*
+   (Chrome/Firefox), open youtube.com **while signed in**, export
+   cookies in **Netscape format**.
+2. On your PC run the helper in this folder (auto-finds the file in
+   Downloads/Desktop, validates it, writes the paste-ready base64 to
+   `_YTDLP_COOKIES_VALUE.txt`):
    ```
    python _make_cookie_env.py
    ```
-4. Open `_YTDLP_COOKIES_VALUE.txt`, Ctrl+A → copy.
-5. Give the value to the bot one of three ways:
-   - **Render Environment tab:** key `YTDLP_COOKIES`, paste the value.
-   - **Blueprint:** it now prompts for `YTDLP_COOKIES` when deploying.
-   - **Render Secret File:** Secrets → add `cookies.txt` with the original
-     (un-encoded) file content instead (appears at
-     `/etc/secrets/cookies.txt`, picked up automatically).
-6. Redeploy; the logs print `Using YouTube cookies: …` and `/diag` shows
-   `cookies: "…"` when it's working. The chat will show
-   `🍪 Using YouTube cookies for the best quality…` on the next request.
-   If YouTube *still* says "not a bot" with cookies set, the cookie file
-   has expired — re-export it (the bot then says so in chat instead of
-   failing cryptically).
+3. Open that file → Ctrl+A → copy → paste into **one** of:
+   - **Render Environment tab:** key `YTDLP_COOKIES` → Save & Deploy.
+   - **Render Secret File:** Secrets → `cookies.txt` with the original
+     (raw) file content (appears at `/etc/secrets/cookies.txt`).
+   - **Blueprint:** it prompts for `YTDLP_COOKIES` when deploying.
+4. Verify: the deploy logs print `Using YouTube cookies: …` and
+   `https://<app>.onrender.com/diag` shows `"cookies": "…"`. Next full
+   download shows `🍪 Using YouTube cookies for the best quality…`.
 
-**Option B — proxy:** add an Environment variable `YTDLP_PROXY` with any
-HTTP/SOCKS proxy URL (e.g. a residential-proxy endpoint). All yt-dlp
-traffic (YouTube + SoundCloud) then goes through it, so the server's own
-IP is never the one YouTube sees.
+Keeping it working:
+| Symptom | Meaning / fix |
+|---|---|
+| Bot says YouTube "refused the configured cookies" | Export a **fresh** cookies.txt right after logging in — Google rotates browser cookies within days |
+| `/diag/sources?src=youtube` → "not a bot" **with** cookies set | Same — the file expired, re-export. A throwaway Google account is fine and safer |
+
+### 2. Proxy — set `YTDLP_PROXY`, YouTube never sees Render's IP
+
+Any HTTP/SOCKS proxy URL works (all yt-dlp traffic, YouTube + SoundCloud,
+goes through it). Options, cheapest first:
+- **Webshare free plan** — 10 proxies, ~1 GB/month (residential US IPs).
+  Enough for MP3s (~4 MB/song → ~250 songs/month). Create an account →
+  Proxy List → copy the `socks5://…` endpoint → `YTDLP_PROXY`.
+- **Any mid-tier residential/mobile proxy** (Webshare paid, IPRoyal,
+  SOAX…). ~$2–4/GB; a residential egress passed YouTube's gate in every
+  test — datacenter proxies (srv) usually *don't*.
+- Not workable on Render: **Cloudflare WARP** inside the container
+  (needs `NET_ADMIN`/tun devices, which Render's Docker runtime
+  disallows).
+
+### 3. What already works without YouTube (no setup needed)
+
+The fallback chain covers most requests with zero credentials — sources
+that don't get IP-gated:
+
+| Order (no cookies) | Source | Notes |
+|---|---|---|
+| 1 | **JioSaavn** | official catalog straight from its CDN; Western hits still fail |
+| 2 | **SoundCloud** | verified re-uploads only (title + duration/artist; slowed-reverb/nightcore/8D/cover junk rejected) |
+| 3 | **Audius** | same strict verification |
+| 4 | **Invidious mirror** | search + extraction happen on *the instance's* IP; media downloads ride Google's CDN (IP-agnostic). Instance list auto-refreshes every 6 h from the official registry |
+| 5 | **YouTube direct** | last for full quality; fast-bails on `not a bot` without cookies |
+
+Two env knobs tune the mirror: `INVIDIOUS_INSTANCES`
+(comma-separated URLs — a **self-hosted** instance list beats every
+public one) and nothing else is required.
+
+### 4. Self-hosted extraction relay (advanced)
+
+- **Own Invidious instance** anywhere with a clean IP (home server,
+  cheap VPS YouTube hasn't flagged, uh vps with a residential subnet)
+  → add it to `INVIDIOUS_INSTANCES`.
+- **Self-hosted cobalt instance** — public cobalt instances mostly need
+  auth now (`api.cobalt.tools` requires JWT) and get blocked by YouTube
+  regularly; only worth it if you run one yourself (then point the
+  mirror/proxy at it).
+
+### Bottom line
+
+- Quick: `python _make_cookie_env.py` → paste value → redeploy (~2 min).
+- No-login: point `YTDLP_PROXY` at a handful of free residential proxies.
+- Do nothing: the fallback chain still delivers most mainstream tracks
+  (Saavn → SoundCloud → Audius → mirrors) — YouTube becomes the problem
+  only for what none of those cataloged.
 
 ## Why full downloads may still occasionally fail
 
 **Fallback sources (new):** without cookies the bot works through sources
-that don't need YouTube at all — first **JioSaavn** (official catalog,
-then **SoundCloud**, then **Audius** (both datacenter-IP friendly). A
-re-upload from SoundCloud/Audius is only ever used when its title,
-artist/duration metadata matches the song you asked for, so you never get
-the wrong track.
+that don't need YouTube at all — first **JioSaavn** (official catalog),
+then **SoundCloud**, then **Audius** (both datacenter-IP friendly), then
+the **Invidious mirror** (YouTube through an instance that does the
+extraction from its own IP — no cookies, no PO tokens; its instance list
+auto-refreshes from the official registry). A re-upload from
+SoundCloud/Audius is only ever used when its title, artist/duration
+metadata matches the song you asked for *and* it isn't a remix/cover/
+"slowed+reverb"/nightcore/8D variant, so you never get the wrong track.
 
 YouTube objecting to datacenter IPs is an arms race. The container now:
 - runs the *bgutil PO-token provider* (Node server on `127.0.0.1:4416`;

@@ -293,8 +293,15 @@ async def _try_saavn(query: str, notify=None, *, title: str = "",
 
 def _sc_filter_ok(c: dict, title: str, artist: str, duration) -> bool:
     """A re-upload may only stand in for the real thing when it's
-    metadata-verified: same title, and artist or duration corroborates it."""
+    metadata-verified: same title, and artist or duration corroborates it.
+    Variant uploads (slowed+reverb, nightcore, remixes, 8D, covers…) are
+    rejected with the same rule as the Audius fallback — without this a
+    "SlowedReverb" clone wins every mainstream search."""
     if _title_sim(c.get("title"), title) < 0.6:
+        return False
+    import audius_source
+    if audius_source._variant_taint(c.get("title")) and \
+            not audius_source._variant_taint(title):
         return False
     if duration:
         if c.get("duration"):
@@ -364,6 +371,27 @@ async def _try_audius(query: str, notify=None, *, title: str = "",
     return ["no faithful audius upload"]
 
 
+# ---------------- Invidious mirrors (YouTube without cookies/IP blocks) -----
+
+async def _try_ytmirror(query: str, notify=None, *, title: str = "",
+                        artist: str = "", duration=None
+                        ) -> tuple[str, dict] | list[str]:
+    import ytmirror_source
+
+    if not title:
+        return ["no metadata for mirror fallback"]
+    try:
+        got = await ytmirror_source.fetch(
+            query, title=title, artist=artist or "", duration=duration,
+            notify=notify)
+    except Exception as e:
+        log.warning("mirror attempt failed: %s", e)
+        got = None
+    if got:
+        return got
+    return ["no verified mirror upload"]
+
+
 # ---------------- entry point ----------------
 
 async def download_best(query: str, notify=None, *, title: str | None = None,
@@ -374,18 +402,21 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
     Source order: without a cookies.txt, JioSaavn goes first — it hosts the
     official catalog outside YouTube's IP blocks (Western covers are
     rejected by metadata checks), then SoundCloud and Audius (both
-    datacenter-IP friendly, metadata-verified re-uploads only), and YouTube
-    last (it only ever answers "Sign in to confirm you're not a bot"
-    without cookies, so we fast-bail on the first block error instead of
-    grinding a 12-attempt matrix). With a cookies.txt, YouTube goes first
-    for full quality, then Saavn, SoundCloud and Audius.
+    datacenter-IP friendly, metadata-verified re-uploads only), then the
+    Invidious mirror (YouTube through an instance that does the extraction
+    for us — works with no cookies, no PO tokens), and direct YouTube last
+    (it only ever answers "Sign in to confirm you're not a bot" without
+    cookies, so we fast-bail on the first block error instead of grinding
+    a 12-attempt matrix). With a cookies.txt, YouTube goes first for full
+    quality, then Saavn, SoundCloud, Audius and the mirror.
     """
     if notify:
         await notify("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     title = title or query
 
-    order = ("youtube", "saavn", "soundcloud", "audius") if COOKIES_FILE \
-        else ("saavn", "soundcloud", "audius", "youtube")
+    order = ("youtube", "saavn", "soundcloud", "audius", "ytmirror") \
+        if COOKIES_FILE \
+        else ("saavn", "soundcloud", "audius", "ytmirror", "youtube")
     if COOKIES_FILE and notify:
         await notify("🍪 Using YouTube cookies for the best quality…")
 
@@ -396,6 +427,8 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
         "soundcloud": lambda: _try_soundcloud(
             query, notify, title=title, artist=artist or "", duration=duration),
         "audius": lambda: _try_audius(
+            query, notify, title=title, artist=artist or "", duration=duration),
+        "ytmirror": lambda: _try_ytmirror(
             query, notify, title=title, artist=artist or "", duration=duration),
     }
     errors: list[str] = []

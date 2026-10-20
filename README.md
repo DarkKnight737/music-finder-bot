@@ -25,12 +25,16 @@ python bot.py
    - **🔗 Full track** — opens the song on Deezer/iTunes.
 
 ## Notes
-- Full songs come from JioSaavn (official catalog) / SoundCloud / Audius,
-  and from YouTube audio via `yt-dlp` when cookies are configured — all
-  converted to 192 kbps MP3 (needs `ffmpeg`).
+- Full songs come from JioSaavn (official catalog) / SoundCloud / Audius /
+  Invidious mirrors (instance list auto-refreshed), and from YouTube audio
+  via `yt-dlp` when cookies are configured — all converted to 192 kbps MP3
+  (needs `ffmpeg`).
 - If YouTube uploads are blocked on the server's IP, the bot automatically
   falls back to the other sources; the reliable fix is a YouTube cookies
-  file (`YTDLP_COOKIES`, see DEPLOY.md).
+  file (`YTDLP_COOKIES`) or a residential proxy (`YTDLP_PROXY`) — see
+  DEPLOY.md for every option ranked.
+- A self-hosted Invidious instance can be added via `INVIDIOUS_INSTANCES`
+  (comma-separated URLs) — the most stable cookie-free route to YouTube.
 - If a full download fails, the bot tells you why in chat and you can retry.
 - Telegram bots can upload files up to ~50 MB — normal songs are fine.
 - Bot uses long polling — no server needed. Stop with `Ctrl+C`.

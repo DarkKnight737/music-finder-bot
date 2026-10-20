@@ -59,8 +59,15 @@ _VARIANT_RE = re.compile(
 
 
 def _variant_taint(title: str) -> bool:
-    """True when any variant label appears in the title."""
-    return bool(_VARIANT_RE.search(title or ""))
+    """True when any variant label appears in the title.
+
+    Compound junk labels like "SlowedReverb" or "Slowed&Reverb" are first
+    split into their two words, since the word-boundary regex can't see
+    them inside a single token."""
+    spaced = re.sub(
+        r"(slow(?:ed)?)\s*(?:and|&|n|\+)\s*(reverb)",
+        r"\1 \2", title or "", flags=re.IGNORECASE)
+    return bool(_VARIANT_RE.search(spaced))
 
 
 async def _base_url() -> str:
@@ -106,12 +113,19 @@ def _ok(c: dict, title: str, artist: str, duration) -> bool:
     """Metadata-verified re-upload rule (same strictness as SoundCloud):
     title must match, and duration and/or artist name corroborates it.
     Variant labels anywhere in the candidate disqualify it, unless the
-    *requested* title itself contains the same label."""
+    *requested* title itself contains the same label.
+
+    "Contained" titles must not run away from the original: an extra
+    padding of >25 chars means the video is *about* the song ("Ed Sheeran
+    and Jimmy Build Shape of You Using a Looping Station", reaction
+    videos, tutorials) — never the track itself."""
     t, want_t = _norm(c.get("title")), _norm(title)
     if not t or not want_t:
         return False
-    if t == want_t or t in want_t or want_t in t:
+    if t == want_t or t in want_t:
         pass                              # trivially same/re-subset title
+    elif want_t in t and len(t) - len(want_t) <= 25:
+        pass                              # small annotation on the same title
     elif SequenceMatcher(None, t, want_t).ratio() < 0.6:
         return False
     if _variant_taint(c.get("title")) and not _variant_taint(title):

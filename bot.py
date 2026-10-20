@@ -781,7 +781,7 @@ def _mini_handlers(app, aio_web):
             return aio_web.json_response(payload)
 
         src = (request.query.get("src") or "all").strip().lower()
-        if src in ("youtube", "saavn", "soundcloud", "audius"):
+        if src in ("youtube", "saavn", "soundcloud", "audius", "ytmirror"):
             if src == "youtube":
                 got = await downloader._try_youtube(q)
             elif src == "soundcloud":
@@ -789,6 +789,9 @@ def _mini_handlers(app, aio_web):
                     q, title=q, artist="")
             elif src == "audius":
                 got = await downloader._try_audius(
+                    q, title=q, artist="")
+            elif src == "ytmirror":
+                got = await downloader._try_ytmirror(
                     q, title=q, artist="")
             else:
                 got = await downloader._try_saavn(q, title=q)
