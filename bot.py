@@ -446,6 +446,9 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
 
 MINI_SESSIONS: dict[int, dict] = {}
 
+# /diag/sources anti-spam: at most one full download probe per 20 seconds.
+_DIAG_LAST = [0.0]
+
 # In-container the page is served from static/index.html. This embedded copy
 # is used when that file is missing (e.g. the deploy repo lacks the static
 # folder), so the Mini App can never 404.
@@ -750,6 +753,45 @@ def _mini_handlers(app, aio_web):
             info["pot_provider"] = {"ok": False, "error": str(e)[:120]}
         return aio_web.json_response(info)
 
+    async def api_diag_sources(request):
+        """Secret-gated: run one real download_best() through every fallback
+        and report which source delivered. Header X-Render-Secret must be
+        the plain BOT_TOKEN or its sha256 hex (same secret as the webhook).
+        Optional ?q=<query> (default: a mainstream wildcard).
+        """
+        secret = request.headers.get("X-Render-Secret") or ""
+        want_tok = config.BOT_TOKEN.encode()
+        want_sha = hashlib.sha256(want_tok).hexdigest().encode()
+        got = secret.encode()
+        if not (hmac.compare_digest(got, want_tok) or
+                hmac.compare_digest(got, want_sha)):
+            return aio_web.json_response({"ok": False, "error": "forbidden"},
+                                         status=403)
+        now = time.time()
+        if now - _DIAG_LAST[0] < 20:
+            return aio_web.json_response(
+                {"ok": False,
+                 "error": "cooldown — try again in a few seconds"}, status=429)
+        _DIAG_LAST[0] = now
+        q = (request.query.get("q") or "shape of you ed sheeran")[:100]
+        started = time.time()
+        try:
+            path, info = await downloader.download_best(
+                q, notify=None, title=q, artist="", duration=None)
+            source = info.get("source")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return aio_web.json_response({
+                "ok": True, "source": source,
+                "title": (info.get("title") or "")[:60],
+                "seconds": round(time.time() - started, 1)})
+        except Exception as e:
+            return aio_web.json_response({
+                "ok": False, "error": str(e)[-300:],
+                "seconds": round(time.time() - started, 1)})
+
     async def api_search(request):
         try:
             body = await request.json()
@@ -923,11 +965,13 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     server = aio_web.Application()
     server.router.add_post(f"/{path_seg}", (webhook_ingest := _make_ingest(app, bot, secret)))
     server.router.add_get("/healthz", lambda _r: aio_web.Response(text="ok"))
-    serve_app, api_search, api_send, api_diag = _mini_handlers(app, aio_web)
+    serve_app, api_search, api_send, api_diag, api_diag_sources = \
+        _mini_handlers(app, aio_web)
     server.router.add_get("/", serve_app)
     server.router.add_get("/app", serve_app)
     server.router.add_get("/app/", serve_app)
     server.router.add_get("/diag", api_diag)
+    server.router.add_get("/diag/sources", api_diag_sources)
     server.router.add_post("/api/search", api_search)
     server.router.add_post("/api/send", api_send)
 
