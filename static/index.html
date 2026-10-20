@@ -46,6 +46,11 @@
   .card .a { color: var(--hint); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .d { color: var(--hint); font-size: 12px; }
   .card button { padding: 8px 12px; font-size: 13px; border-radius: 10px; }
+  #morewrap { text-align: center; padding: 4px 0 12px; }
+  #morewrap button {
+    padding: 10px 26px; font-size: 14px; background: var(--sec);
+    color: var(--accent); font-weight: 600;
+  }
   footer { text-align: center; color: var(--hint); font-size: 12px; padding: 14px 0 24px; }
 </style>
 </head>
@@ -100,35 +105,69 @@
     try {
       const r = await api("/api/search", { initData: tg.initData || "", query: q });
       if (!r.tracks.length) { s("😕 Nothing found — try the exact title."); return; }
-      s(r.tracks.length + " results — tap a card");
-      resultsEl.innerHTML = "";
-      r.tracks.forEach(t => {
-        const card = document.createElement("div");
-        card.className = "card";
-
-        const info = document.createElement("div");
-        info.className = "info";
-        const t1 = document.createElement("div"); t1.className = "t";
-        t1.textContent = (t.index + 1) + ". " + t.title;
-        const t2 = document.createElement("div"); t2.className = "a";
-        t2.textContent = t.artist + (t.album ? " · " + t.album : "");
-        const t3 = document.createElement("div"); t3.className = "d";
-        t3.textContent = Math.floor(t.duration / 60) + ":" +
-          String(t.duration % 60).padStart(2, "0");
-        info.append(t1, t2, t3);
-
-        const btn = document.createElement("button");
-        btn.textContent = "♪ Get";
-        btn.onclick = () => send(t, card);
-
-        card.append(info, btn);
-        resultsEl.append(card);
-      });
+      r.tracks.forEach(t => resultsEl.append(makeCard(t)));
+      s(r.total + " results — tap a card");
+      updateMore(r);
     } catch (e) {
       s("⚠️ " + e.message);
     } finally {
       $("go").disabled = false;
     }
+  }
+
+  function makeCard(t) {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const info = document.createElement("div");
+    info.className = "info";
+    const t1 = document.createElement("div"); t1.className = "t";
+    t1.textContent = (t.index + 1) + ". " + t.title;
+    const t2 = document.createElement("div"); t2.className = "a";
+    t2.textContent = t.artist + (t.album ? " · " + t.album : "");
+    const t3 = document.createElement("div"); t3.className = "d";
+    t3.textContent = Math.floor(t.duration / 60) + ":" +
+      String(t.duration % 60).padStart(2, "0");
+    info.append(t1, t2, t3);
+
+    const btn = document.createElement("button");
+    btn.textContent = "♪ Get";
+    btn.onclick = () => send(t, card);
+
+    card.append(info, btn);
+    return card;
+  }
+
+  function updateMore(r) {
+    const old = document.getElementById("morewrap");
+    if (old) old.remove();
+    if (!r.hasMore) return;
+    const wrap = document.createElement("div");
+    wrap.id = "morewrap";
+    const btn = document.createElement("button");
+    btn.textContent = "➕ Load more";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "…";
+      s("🔎 Loading more…");
+      try {
+        const r2 = await api("/api/search", {
+          initData: tg.initData || "",
+          query: $("q").value.trim(),
+          loadMore: true,
+        });
+        r2.tracks.forEach(t => resultsEl.append(makeCard(t)));
+        s(r2.total + " results — tap a card");
+        updateMore(r2);
+        tg.HapticFeedback.impactOccurred("light");
+      } catch (e) {
+        s("⚠️ " + e.message);
+        btn.disabled = false;
+        btn.textContent = "➕ Load more";
+      }
+    };
+    wrap.append(btn);
+    resultsEl.append(wrap);
   }
 
   async function send(t, card) {
