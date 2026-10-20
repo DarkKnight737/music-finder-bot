@@ -279,7 +279,9 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
     query = query_text or f"{t['artist']} {t['title']}".strip()
     await runner.status("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     try:
-        path, info = await downloader.download_best(query, notify=runner.status)
+        path, info = await downloader.download_best(
+            query, notify=runner.status,
+            title=t["title"], artist=t["artist"], duration=t["duration"] or None)
     except Exception as e:
         log.warning("full download failed: %s", e)
         await runner.status(
@@ -494,36 +496,50 @@ def _remember_mini(uid: int, tracks: list[dict], query: str) -> None:
 
 
 def validate_initdata(raw: str) -> dict | None:
-    """HMAC-validate Telegram WebApp initData; returns the user dict or None.
+    """HMAC-validate Telegram WebApp initData; returns the user dict or None."""
+    user, _ = validate_initdata_ex(raw)
+    return user
 
-    Per https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app:
-    the data-check-string is built from the *URL-decoded* key=value pairs
-    (sorted alphabetically, `hash` excluded) joined with newlines. Hashing the
-    raw urlencoded string never matches when values contain %XX escapes
-    (the `user` field always does), so values must be decoded first.
-    """
-    if not raw or "hash=" not in raw:
-        return None
+
+def validate_initdata_ex(raw: str) -> tuple[dict | None, str]:
+    """Same as validate_initdata but also returns a failure reason:
+    'ok' | 'empty' | 'malformed' | 'no-hash' | 'hash-mismatch' | 'bad-user'."""
+    if not raw or not raw.strip():
+        return None, "empty"
     try:
         fields = dict(urllib.parse.parse_qsl(raw, keep_blank_values=True))
-        provided = fields.pop("hash", "")
-        if not provided:
-            return None
-        data_check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
-        secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, provided):
-            log.warning("Mini App initData: hash mismatch")
-            return None
+    except ValueError:
+        return None, "malformed"
+    provided = fields.pop("hash", "")
+    if not provided:
+        return None, "no-hash"
+    # Per https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app:
+    # the data-check-string is built from the *URL-decoded* key=value pairs
+    # (sorted alphabetically, `hash` excluded) joined with newlines. Hashing the
+    # raw urlencoded string never matches when values contain %XX escapes
+    # (the `user` field always does), so values must be decoded first. The
+    # `signature` field, when present, IS part of the hash (verified against
+    # real captured Telegram initData samples).
+    data_check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", config.BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, provided):
+        return None, "hash-mismatch"
+    try:
         user = json.loads(fields.get("user") or "")
         uid = int(user.get("id") or 0)
-        return user if uid else None
     except Exception:
-        return None
+        return None, "bad-user"
+    return (user if uid else None), ("ok" if uid else "bad-user")
 
 
 def _mini_handlers(app, aio_web):
     bot = app.bot
+
+    def _server_bot() -> str:
+        uname = getattr(app.bot_data, "get", lambda *_: None)("bot_username") \
+            or "the bot"
+        return f"@{uname}"
 
     async def serve_app(_request):
         try:
@@ -533,14 +549,54 @@ def _mini_handlers(app, aio_web):
         return aio_web.Response(text=page, content_type="text/html",
                                 charset="utf-8")
 
+    async def api_diag(request):
+        """Public diagnostics so deploy state can be checked from a browser."""
+        import yt_dlp
+        import shutil
+        info: dict = {
+            "server_bot": _server_bot().strip("@"),
+            "bot_token_id": config.BOT_TOKEN.split(":", 1)[0],
+            "yt_dlp": yt_dlp.version.__version__,
+            "ffmpeg": bool(shutil.which("ffmpeg")),
+            "cookies": downloader.COOKIES_FILE or None,
+        }
+        try:
+            r = await bot.get_me()
+            info["api_ok"] = True
+        except Exception as e:
+            info["api_ok"] = False
+            info["api_error"] = str(e)[:120]
+        try:
+            import httpx
+            rp = httpx.get("http://127.0.0.1:4416/ping", timeout=4)
+            info["pot_provider"] = {"ok": True,
+                                    "version": rp.json().get("version")}
+        except Exception as e:
+            info["pot_provider"] = {"ok": False, "error": str(e)[:120]}
+        return aio_web.json_response(info)
+
     async def api_search(request):
         try:
             body = await request.json()
         except Exception:
             return aio_web.json_response({"ok": False, "error": "bad json"}, status=400)
-        user = validate_initdata(body.get("initData") or "")
+        user, reason = validate_initdata_ex(body.get("initData") or "")
         if user is None:
-            return aio_web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+            log.warning("Mini App auth failed (reason=%s)", reason)
+            if reason in ("empty", "malformed", "no-hash"):
+                return aio_web.json_response({
+                    "ok": False, "error":
+                    "no Telegram session — open the app via the 🎵 Music App "
+                    f"button in the chat with {_server_bot()} "
+                    "(not a browser tab or history link)"}, status=401)
+            if reason == "hash-mismatch":
+                return aio_web.json_response({
+                    "ok": False, "error":
+                    f"app opened by a different bot — send /start to "
+                    f"{_server_bot()} and tap the Music App button there "
+                    "(or check the server's BOT_TOKEN)"}, status=401)
+            return aio_web.json_response(
+                {"ok": False, "error": "sign in failed — reopen the app"}, status=401)
         query = (body.get("query") or "").strip()[:120]
         if not query:
             return aio_web.json_response({"ok": False, "error": "no query"}, status=400)
@@ -562,7 +618,10 @@ def _mini_handlers(app, aio_web):
             return aio_web.json_response({"ok": False, "error": "bad json"}, status=400)
         user = validate_initdata(body.get("initData") or "")
         if user is None:
-            return aio_web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+            return aio_web.json_response(
+                {"ok": False, "error":
+                 "sign in failed — reopen the app via the Music App button"},
+                status=401)
         session = MINI_SESSIONS.get(user["id"])
         if not session:
             return aio_web.json_response({"ok": False, "error": "search first"}, status=400)
@@ -583,7 +642,7 @@ def _mini_handlers(app, aio_web):
         task.add_done_callback(_log_task)
         return aio_web.json_response({"ok": True})
 
-    return serve_app, api_search, api_send
+    return serve_app, api_search, api_send, api_diag
 
 
 # ---------------- entry points ----------------
@@ -640,6 +699,10 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     webhook_url = f"{base}/{path_seg}"
 
     await app.initialize()
+    me = await bot.get_me()
+    app.bot_data["bot_username"] = me.username
+    log.info("Server bot identity: @%s (token id %s)",
+             me.username, config.BOT_TOKEN.split(":", 1)[0])
     await bot.set_webhook(
         url=webhook_url,
         secret_token=secret,
@@ -658,10 +721,11 @@ async def _run_webhook_mode(port: int, base: str) -> None:
     server = aio_web.Application()
     server.router.add_post(f"/{path_seg}", (webhook_ingest := _make_ingest(app, bot, secret)))
     server.router.add_get("/healthz", lambda _r: aio_web.Response(text="ok"))
-    serve_app, api_search, api_send = _mini_handlers(app, aio_web)
+    serve_app, api_search, api_send, api_diag = _mini_handlers(app, aio_web)
     server.router.add_get("/", serve_app)
     server.router.add_get("/app", serve_app)
     server.router.add_get("/app/", serve_app)
+    server.router.add_get("/diag", api_diag)
     server.router.add_post("/api/search", api_search)
     server.router.add_post("/api/send", api_send)
 
