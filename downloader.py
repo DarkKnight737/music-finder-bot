@@ -4,13 +4,15 @@ Primary w/o cookies: JioSaavn — official full songs (strong for
 Bollywood/regional; Western covers are auto-rejected) straight from its CDN,
 and unlike YouTube it does not block datacenter IPs. No cookies, no tokens.
 
-Fallbacks: SoundCloud (datacenter-IP friendly; metadata-verified re-uploads
-only) and YouTube via yt-dlp — In 2026 YouTube aggressively blocks datacenter
-IPs, so the scan tries several player clients, can use a local bgutil PO-token
-provider (see Dockerfile) and benefits enormously from a cookies.txt. With a
-cookies.txt YouTube is tried first again (full quality).
+Final fallbacks: SoundCloud and Audius (both datacenter-IP friendly;
+metadata-verified re-uploads only) and YouTube via yt-dlp — In 2026 YouTube
+aggressively blocks datacenter IPs, so the scan tries several player
+clients, can use a local bgutil PO-token provider (see Dockerfile) and
+benefits enormously from a cookies.txt. With a cookies.txt YouTube is tried
+first again (full quality).
 """
 import asyncio
+import base64
 import logging
 import os
 import shutil
@@ -25,18 +27,66 @@ TEMP = os.path.join(os.path.dirname(__file__), "_downloads")
 os.makedirs(TEMP, exist_ok=True)
 
 # YouTube hard-blocks datacenter IPs (Render etc.) unless the requests carry
-# authenticated cookies. Provide a Netscape-format cookies.txt via the
-# YTDLP_COOKIES env var, a file mounted at /etc/secrets/cookies.txt (Render
-# "Secret Files"), or ./cookies.txt next to downloader.py.
-_COOKIES_CANDIDATES = (
-    os.getenv("YTDLP_COOKIES") or "",
-    "/etc/secrets/cookies.txt",
-    os.path.join(os.path.dirname(__file__), "cookies.txt"),
-)
-COOKIES_FILE = next(
-    (p for p in _COOKIES_CANDIDATES if p and os.path.exists(p)), "")
+# authenticated cookies. Sources, in order of convenience:
+#   • YTDLP_COOKIES env var: a path to a Netscape cookies.txt, the file
+#     content pasted straight in, or that content base64-encoded
+#     (env-var dashboards dislike newlines).
+#   • a Render "Secret File" mounted at /etc/secrets/cookies.txt
+#   • ./cookies.txt next to downloader.py
+# Any optional YouTube (-only) HTTP/SOCKS proxy can be set with YTDLP_PROXY.
+
+
+def _log(msg: str, *a) -> None:
+    log.info(msg, *a)
+
+
+def _looks_netscape(text: str) -> bool:
+    if "# Netscape" in text or "# HTTP Cookie File" in text:
+        return True
+    rows = [ln for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    return bool(rows) and all(ln.count("\t") >= 5 for ln in rows[:5])
+
+
+def _resolve_cookies() -> str:
+    """Returns a cookies.txt path usable by yt-dlp, or "" if none found."""
+    env = (os.getenv("YTDLP_COOKIES") or "").strip()
+    if env and os.path.isfile(env):                      # direct path
+        return env
+    for p in ("/etc/secrets/cookies.txt",
+              os.path.join(os.path.dirname(__file__), "cookies.txt")):
+        if os.path.isfile(p):
+            return p
+    if env:                                              # inline content?
+        raw = env
+        if not _looks_netscape(raw):                     # try base64 decode
+            try:
+                decoded = base64.b64decode(raw, validate=True).decode(
+                    "utf-8", "replace")
+            except Exception:
+                decoded = ""
+            if _looks_netscape(decoded):
+                raw = decoded
+        if _looks_netscape(raw):
+            path = os.path.join(TEMP, "cookies_from_env.txt")
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(raw if raw.endswith("\n") else raw + "\n")
+            _log("Using YouTube cookies from YTDLP_COOKIES (inline content)")
+            return path
+        _log("YTDLP_COOKIES set but not a valid cookies.txt path, content "
+             "or base64 — ignoring it")
+    return ""
+
+
+COOKIES_FILE = _resolve_cookies()
 if COOKIES_FILE:
-    log.info("Using YouTube cookies: %s", COOKIES_FILE)
+    _log("Using YouTube cookies: %s", COOKIES_FILE)
+
+# Route all yt-dlp traffic through a proxy when provided (the classic fix
+# for datacenter-IP blocks when a cookies.txt can't be maintained).
+PROXY = (os.getenv("YTDLP_PROXY") or "").strip()
+if PROXY:
+    _log("Routing yt-dlp via YTDLP_PROXY (%s)", PROXY)
 
 _MIN_DUR = 40
 _MAX_DUR = 20 * 60
@@ -59,12 +109,15 @@ _ydl_base = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
+    "progress": False,
     "socket_timeout": 20,
     "retries": 3,
     "nocheckcertificate": True,
 }
 if COOKIES_FILE:
     _ydl_base["cookiefile"] = COOKIES_FILE
+if PROXY:
+    _ydl_base["proxy"] = PROXY
 
 
 def _norm(s: str) -> str:
@@ -281,6 +334,27 @@ async def _try_soundcloud(query: str, notify=None, *, title: str = "",
     return errors
 
 
+# ---------------- Audius (metadata-verified re-uploads, no IP blocks) -------
+
+async def _try_audius(query: str, notify=None, *, title: str = "",
+                      artist: str = "", duration=None
+                      ) -> tuple[str, dict] | list[str]:
+    import audius_source
+
+    if not title:
+        return ["no metadata for audius fallback"]
+    try:
+        got = await audius_source.fetch(
+            query, title=title, artist=artist or "", duration=duration,
+            notify=notify)
+    except Exception as e:
+        log.warning("audius attempt failed: %s", e)
+        got = None
+    if got:
+        return got
+    return ["no faithful audius upload"]
+
+
 # ---------------- entry point ----------------
 
 async def download_best(query: str, notify=None, *, title: str | None = None,
@@ -290,18 +364,19 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
 
     Source order: without a cookies.txt, JioSaavn goes first — it hosts the
     official catalog outside YouTube's IP blocks (Western covers are
-    rejected by metadata checks), then SoundCloud (datacenter-IP friendly),
-    and YouTube last (it only ever answers "Sign in to confirm you're not a
-    bot" without cookies, so we fast-bail on the first block error instead
-    of grinding a 12-attempt matrix). With a cookies.txt, YouTube goes first
-    for full quality, then Saavn, then SoundCloud.
+    rejected by metadata checks), then SoundCloud and Audius (both
+    datacenter-IP friendly, metadata-verified re-uploads only), and YouTube
+    last (it only ever answers "Sign in to confirm you're not a bot"
+    without cookies, so we fast-bail on the first block error instead of
+    grinding a 12-attempt matrix). With a cookies.txt, YouTube goes first
+    for full quality, then Saavn, SoundCloud and Audius.
     """
     if notify:
         await notify("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     title = title or query
 
-    order = ("youtube", "saavn", "soundcloud") if COOKIES_FILE else (
-        "saavn", "soundcloud", "youtube")
+    order = ("youtube", "saavn", "soundcloud", "audius") if COOKIES_FILE \
+        else ("saavn", "soundcloud", "audius", "youtube")
     if COOKIES_FILE and notify:
         await notify("🍪 Using YouTube cookies for the best quality…")
 
@@ -310,6 +385,8 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
             query, notify, title=title, artist=artist or "", duration=duration),
         "youtube": lambda: _try_youtube(query, notify),
         "soundcloud": lambda: _try_soundcloud(
+            query, notify, title=title, artist=artist or "", duration=duration),
+        "audius": lambda: _try_audius(
             query, notify, title=title, artist=artist or "", duration=duration),
     }
     errors: list[str] = []
@@ -325,11 +402,17 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
         errors.extend(got or [])
 
     msg = "; ".join(errors[-2:]) or "download failed"
-    low = [e.lower() for e in errors]
+    low = " ".join(e.lower() for e in errors)
+    hit_yt_block = any(m in low for m in ("not a bot", "sign in", "cookies"))
     if not COOKIES_FILE and any(
-            m in e for e in low for m in ("403", "rate limit", "blocked",
-                                          "not a bot", "sign in")):
-        msg += " — YouTube is blocking this server's IP; add a cookies.txt file"
+            m in low for m in ("403", "rate limit", "blocked",
+                               "not a bot", "sign in", "cookies")):
+        msg += (" — YouTube is blocking this server's IP; add a YouTube "
+                "cookies.txt (YTDLP_COOKIES env var or cookies.txt secret "
+                "file) or set YTDLP_PROXY")
+    elif COOKIES_FILE and hit_yt_block:
+        msg += (" — YouTube refused the configured cookies; they may be "
+                "expired — re-export a fresh cookies.txt")
     raise RuntimeError(msg)
 
 

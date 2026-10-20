@@ -25,7 +25,12 @@ python bot.py
    - **🔗 Full track** — opens the song on Deezer/iTunes.
 
 ## Notes
-- Full songs come from YouTube audio via `yt-dlp` → MP3 (needs `ffmpeg`; found on this machine ✔).
+- Full songs come from JioSaavn (official catalog) / SoundCloud / Audius,
+  and from YouTube audio via `yt-dlp` when cookies are configured — all
+  converted to 192 kbps MP3 (needs `ffmpeg`).
+- If YouTube uploads are blocked on the server's IP, the bot automatically
+  falls back to the other sources; the reliable fix is a YouTube cookies
+  file (`YTDLP_COOKIES`, see DEPLOY.md).
 - If a full download fails, the bot tells you why in chat and you can retry.
 - Telegram bots can upload files up to ~50 MB — normal songs are fine.
 - Bot uses long polling — no server needed. Stop with `Ctrl+C`.

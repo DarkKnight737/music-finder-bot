@@ -42,6 +42,23 @@ def esc(s: str) -> str:
     return html.escape(s or "")
 
 
+def tail(s: str, limit: int = 220) -> str:
+    """Last `limit` chars of an error, cut at a word boundary.
+
+    The raw reasons sit at the end of the composed message, so we keep the
+    tail — but slicing at an arbitrary offset chops words ("…nfirm you're
+    not a bot"), so back up to the first space and mark the cut with "…".
+    """
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    if len(s) <= limit:
+        return s
+    cut = s[-limit:]
+    sp = cut.find(" ")
+    if 0 < sp < limit - 20:
+        cut = cut[sp + 1:]
+    return "…" + cut
+
+
 def clean_song_title(s: str) -> str:
     """Strip YouTube junk like '(Official Video)', '(Lyrics)' etc."""
     return re.sub(
@@ -293,13 +310,16 @@ class _ChatRunner:
 
     async def status(self, text: str) -> None:
         if self._note is None:
-            self._note = await self.bot.send_message(
-                self.chat_id, text, parse_mode=ParseMode.HTML)
-        else:
             try:
-                await self._note.edit_text(text)
-            except Exception:
-                pass
+                self._note = await self.bot.send_message(
+                    self.chat_id, text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.debug("status note skipped: %s", e)
+            return
+        try:
+            await self._note.edit_text(text)
+        except Exception:
+            pass
 
     async def status_done(self) -> None:
         if self._note is None:
@@ -385,7 +405,7 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
             log.warning("full download failed: %s", e)
             await runner.status(
                 "⚠️ Couldn't fetch the full song right now.\n"
-                f"<i>{esc(str(e)[-180:])}</i>\n"
+                f"<i>{esc(tail(str(e)))}</i>\n"
                 "Please try again in a bit, or use the 🔗 Full track link.")
             return
 
@@ -414,7 +434,7 @@ async def run_download_delivery(runner: _ChatRunner, t: dict,
             else:
                 await runner.status(
                     "⚠️ Telegram didn't accept the song — please try again.\n"
-                    f"<i>{esc(str(e)[-180:])}</i>")
+                    f"<i>{esc(tail(str(e)))}</i>")
     finally:
         if path:
             downloader.cleanup(path)
@@ -713,6 +733,7 @@ def _mini_handlers(app, aio_web):
             "yt_dlp": yt_dlp.version.__version__,
             "ffmpeg": bool(shutil.which("ffmpeg")),
             "cookies": downloader.COOKIES_FILE or None,
+            "proxy": downloader.PROXY or None,
         }
         try:
             r = await bot.get_me()

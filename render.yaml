@@ -7,4 +7,10 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      # YouTube blocks datacenter IPs; set either of these when the
+      # Blueprint prompts for them (see DEPLOY.md "quick fix").
+      - key: YTDLP_COOKIES   # path, base64 or raw cookies.txt content
+        sync: false
+      - key: YTDLP_PROXY     # optional http(s)/socks proxy URL
+        sync: false
     autoDeploy: true
