@@ -22,7 +22,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py music_service.py downloader.py config.py ./
+COPY bot.py music_service.py downloader.py saavn_source.py config.py ./
 COPY static ./static
 RUN mkdir -p /tmp/_downloads
 

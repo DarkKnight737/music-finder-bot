@@ -1,11 +1,14 @@
 """Full-song fetchers.
 
-Primary: YouTube via yt-dlp. In 2026 YouTube aggressively blocks datacenter
-IPs, so the scan tries several player clients, can use a local bgutil PO-token
-provider (see Dockerfile) and benefits enormously from a cookies.txt.
+Primary w/o cookies: JioSaavn — official full songs (strong for
+Bollywood/regional; Western covers are auto-rejected) straight from its CDN,
+and unlike YouTube it does not block datacenter IPs. No cookies, no tokens.
 
-Fallback: SoundCloud — datacenter-IP friendly. DRM-protected official uploads
-are skipped automatically; metadata-verified full re-uploads are accepted.
+Fallbacks: SoundCloud (datacenter-IP friendly; metadata-verified re-uploads
+only) and YouTube via yt-dlp — In 2026 YouTube aggressively blocks datacenter
+IPs, so the scan tries several player clients, can use a local bgutil PO-token
+provider (see Dockerfile) and benefits enormously from a cookies.txt. With a
+cookies.txt YouTube is tried first again (full quality).
 """
 import asyncio
 import logging
@@ -203,6 +206,27 @@ async def _try_youtube(query: str, notify=None) -> tuple[str, dict] | list[str]:
     return errors
 
 
+# ---------------- JioSaavn (official catalog, no IP blocks) ----------------
+
+async def _try_saavn(query: str, notify=None, *, title: str = "",
+                     artist: str = "", duration=None
+                     ) -> tuple[str, dict] | list[str]:
+    import saavn_source  # local import: needs `cryptography` optional dep
+
+    if not title:
+        return ["no metadata for saavn catalog"]
+    try:
+        got = await saavn_source.fetch(
+            query, title=title, artist=artist or "", duration=duration,
+            notify=notify)
+    except Exception as e:
+        log.warning("saavn attempt failed: %s", e)
+        got = None
+    if got:
+        return got
+    return ["no official match on jiosaavn"]
+
+
 # ---------------- SoundCloud (datacenter-IP friendly fallback) ----------------
 
 def _sc_filter_ok(c: dict, title: str, artist: str, duration) -> bool:
@@ -237,6 +261,9 @@ async def _try_soundcloud(query: str, notify=None, *, title: str = "",
                 if _sc_filter_ok(c, title, artist, duration)]
     if not verified:
         return ["no matching soundcloud re-upload"]
+    if duration:
+        verified.sort(key=lambda c: abs(
+            (c.get("duration") or 10**6) - int(duration)))
     deadline = time.monotonic() + 60
     for c in verified[:3]:
         if time.monotonic() > deadline:
@@ -261,21 +288,26 @@ async def download_best(query: str, notify=None, *, title: str | None = None,
                         duration: int | None = None) -> tuple[str, dict]:
     """Search+download a full song.
 
-    Source order: with a cookies.txt, YouTube goes first (full quality).
-    Without one, SoundCloud goes first on datacenter IPs (YouTube only ever
-    answers "Sign in to confirm you're not a bot" there) and YouTube serves
-    as the fallback — it also fast-bails on the first bot-block error so we
-    reach the song instead of grinding a 12-attempt matrix.
+    Source order: without a cookies.txt, JioSaavn goes first — it hosts the
+    official catalog outside YouTube's IP blocks (Western covers are
+    rejected by metadata checks), then SoundCloud (datacenter-IP friendly),
+    and YouTube last (it only ever answers "Sign in to confirm you're not a
+    bot" without cookies, so we fast-bail on the first block error instead
+    of grinding a 12-attempt matrix). With a cookies.txt, YouTube goes first
+    for full quality, then Saavn, then SoundCloud.
     """
     if notify:
         await notify("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
     title = title or query
 
-    order = ("youtube", "soundcloud") if COOKIES_FILE else ("soundcloud", "youtube")
+    order = ("youtube", "saavn", "soundcloud") if COOKIES_FILE else (
+        "saavn", "soundcloud", "youtube")
     if COOKIES_FILE and notify:
         await notify("🍪 Using YouTube cookies for the best quality…")
 
     attempts = {
+        "saavn": lambda: _try_saavn(
+            query, notify, title=title, artist=artist or "", duration=duration),
         "youtube": lambda: _try_youtube(query, notify),
         "soundcloud": lambda: _try_soundcloud(
             query, notify, title=title, artist=artist or "", duration=duration),
