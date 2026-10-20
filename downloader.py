@@ -88,6 +88,12 @@ PROXY = (os.getenv("YTDLP_PROXY") or "").strip()
 if PROXY:
     _log("Routing yt-dlp via YTDLP_PROXY (%s)", PROXY)
 
+# yt-dlp's YouTube extraction needs a JS runtime for the player/cookie
+# challenges ("The page needs to be reloaded" without one). Only deno is
+# enabled by default, so point it at whichever runtime actually exists.
+# The server image ships Node (for the PO-token provider).
+_JS_RUNTIME = shutil.which("deno") or shutil.which("node") or ""
+
 _MIN_DUR = 40
 _MAX_DUR = 20 * 60
 _TIME_BUDGET = 150  # seconds for the whole search+download effort
@@ -118,6 +124,9 @@ if COOKIES_FILE:
     _ydl_base["cookiefile"] = COOKIES_FILE
 if PROXY:
     _ydl_base["proxy"] = PROXY
+if _JS_RUNTIME:
+    _name = os.path.splitext(os.path.basename(_JS_RUNTIME))[0].lower()
+    _ydl_base["js_runtimes"] = {_name: {}}
 
 
 def _norm(s: str) -> str:
