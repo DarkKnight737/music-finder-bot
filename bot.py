@@ -99,15 +99,22 @@ def check_pot_provider() -> None:
 
 # ---------------- keyboards / texts ----------------
 
-def list_kb(tracks: list[dict]) -> InlineKeyboardMarkup:
+def list_kb(tracks: list[dict], has_more: bool = False) -> InlineKeyboardMarkup:
     rows = []
     for i, t in enumerate(tracks):
         label = f"{i + 1}. {t['title'][:26]} — {t['artist'][:20]}"
         rows.append([InlineKeyboardButton(label, callback_data=f"track|{i}")])
-    rows.append([
-        InlineKeyboardButton("✖️ Close", callback_data="close"),
-        InlineKeyboardButton("🔍 New search", callback_data="new"),
-    ])
+    if has_more:
+        rows.append([
+            InlineKeyboardButton("➕ Load more", callback_data="more"),
+            InlineKeyboardButton("🔍 New search", callback_data="new"),
+        ])
+        rows.append([InlineKeyboardButton("✖️ Close", callback_data="close")])
+    else:
+        rows.append([
+            InlineKeyboardButton("✖️ Close", callback_data="close"),
+            InlineKeyboardButton("🔍 New search", callback_data="new"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -166,8 +173,33 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.chat_data["tracks"] = tracks
     context.chat_data["query"] = query
+    context.chat_data["page"] = 1
+    context.chat_data["has_more"] = len(tracks) >= config.RESULTS_LIMIT
     await msg.edit_text(list_text(query, tracks), parse_mode=ParseMode.HTML,
-                        reply_markup=list_kb(tracks))
+                        reply_markup=list_kb(
+                            tracks, context.chat_data["has_more"]))
+
+
+async def fetch_more(query: str, tracks: list[dict],
+                     page: int) -> tuple[list[dict], bool]:
+    """Fetch the next page for `query`, merge (deduped) into `tracks`.
+
+    Returns (new_tracks_added, likely_has_more). Mutates `tracks` in place.
+    """
+    new = await music_service.search_all(query, config.RESULTS_LIMIT,
+                                         index=page * config.RESULTS_LIMIT)
+    seen = {(t["artist"].lower(), t["title"].lower()) for t in tracks}
+    added = []
+    for t in new:
+        if not t["title"]:
+            continue
+        key = (t["artist"].lower(), t["title"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        tracks.append(t)
+        added.append(t)
+    return added, len(new) >= config.RESULTS_LIMIT
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -196,13 +228,39 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("⌛ Expired — search again please.")
             return
         await q.edit_message_text(list_text(context.chat_data.get("query", ""), tracks),
-                                  parse_mode=ParseMode.HTML, reply_markup=list_kb(tracks))
+                                  parse_mode=ParseMode.HTML,
+                                  reply_markup=list_kb(tracks,
+                                  context.chat_data.get("has_more", False)))
+        return
+
+    if data == "more":
+        query = context.chat_data.get("query", "")
+        if not tracks or not query:
+            await q.edit_message_text("⌛ Expired — search again please.")
+            return
+        page = context.chat_data.get("page", 1)
+        added, has_more = await fetch_more(query, tracks, page)
+        if added:
+            context.chat_data["page"] = page + 1
+            context.chat_data["has_more"] = has_more
+            await q.edit_message_text(list_text(query, tracks),
+                                      parse_mode=ParseMode.HTML,
+                                      reply_markup=list_kb(tracks, has_more))
+        else:
+            await q.edit_message_text(
+                list_text(query, tracks)
+                + "\n\n<i>That's everything I could find for this one 🙂</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=list_kb(tracks, False))
         return
 
     parts = data.split("|")
     if len(parts) != 2 or parts[0] not in ("track", "full"):
         return
-    idx = int(parts[1])
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        return
 
     if not tracks or idx >= len(tracks):
         await q.edit_message_text("⌛ Expired — search again please.")
@@ -273,40 +331,95 @@ class _ChatRunner:
             )
 
 
+async def _send_audio(runner: _ChatRunner, t: dict, path: str, title: str,
+                      duration: int) -> None:
+    """Send the MP3 with a cover thumbnail, degrading gracefully.
+
+    Telegram rejects thumbnails that aren't JPEGs under 200 KB (many cover
+    images are), which would otherwise kill the whole delivery silently.
+    """
+    thumb = None
+    if t.get("thumb"):
+        try:
+            thumb = await music_service.download_file(t["thumb"])
+        except Exception as e:  # thumbnail is optional — never fatal
+            log.debug("thumbnail skipped: %s", e)
+        if thumb and len(thumb) > 190_000:  # Bot API: JPEG < 200 KB
+            thumb = None
+
+    caption = (f"🎵 <b>{esc(clean_song_title(title))}</b>\n"
+               f"👤 {esc(t['artist'])}\n"
+               f"⏱ {music_service.fmt_duration(duration)} · full song 🎵")
+    base = dict(audio_path=path, title=title,
+                performer=t["artist"][:60] or None,
+                duration=duration or None, caption=caption)
+    if thumb:
+        try:
+            await runner.audio(thumb=thumb, **base)
+            return
+        except Exception as e:
+            log.warning("audio with thumbnail failed (%s) — retrying without",
+                        e)
+    await runner.audio(**base)
+
+
 async def run_download_delivery(runner: _ChatRunner, t: dict,
                                 query_text: str | None = None) -> None:
-    """Full song as MP3; on failure just report why (no 30s preview fallback)."""
-    query = query_text or f"{t['artist']} {t['title']}".strip()
-    await runner.status("⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
-    try:
-        path, info = await downloader.download_best(
-            query, notify=runner.status,
-            title=t["title"], artist=t["artist"], duration=t["duration"] or None)
-    except Exception as e:
-        log.warning("full download failed: %s", e)
-        await runner.status(
-            "⚠️ Couldn't fetch the full song right now.\n"
-            f"<i>{esc(str(e)[-180:])}</i>\n"
-            "Please try again in a bit, or use the 🔗 Full track link.")
-        await runner.status_done()
-        return
+    """Full song as MP3; on failure always *say why* (never go silent).
 
+    The status note is only deleted when the song was delivered OK — error
+    messages must stay visible in the chat.
+    """
+    query = query_text or f"{t['artist']} {t['title']}".strip()
+    path: str | None = None
+    delivered = False
     try:
+        await runner.status(
+            "⏳ Getting the full song…\n<i>(usually 10–30 seconds)</i>")
+        try:
+            path, info = await downloader.download_best(
+                query, notify=runner.status,
+                title=t["title"], artist=t["artist"],
+                duration=t["duration"] or None)
+        except Exception as e:
+            log.warning("full download failed: %s", e)
+            await runner.status(
+                "⚠️ Couldn't fetch the full song right now.\n"
+                f"<i>{esc(str(e)[-180:])}</i>\n"
+                "Please try again in a bit, or use the 🔗 Full track link.")
+            return
+
         title = clean_song_title(info.get("title") or t["title"])[:60]
         duration = int(info.get("duration") or t["duration"] or 0)
-        caption = (f"🎵 <b>{esc(clean_song_title(title))}</b>\n"
-                   f"👤 {esc(t['artist'])}\n"
-                   f"⏱ {music_service.fmt_duration(duration)} · full song 🎵")
-        thumb = await music_service.download_file(t.get("thumb") or "")
-        await runner.audio(
-            audio_path=path, title=title,
-            performer=t["artist"][:60] or None,
-            duration=duration or None,
-            caption=caption, thumb=thumb,
-        )
+
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size > 48_000_000:  # Telegram bots can't upload > 50 MB
+            log.warning("audio too large to send: %d bytes", size)
+            await runner.status(
+                "⚠️ That song's audio file is too large for Telegram "
+                "(50 MB bot limit) — I can't send it, sorry! 🙏")
+            return
+
+        try:
+            await _send_audio(runner, t, path, title, duration)
+            delivered = True
+        except Exception as e:
+            log.warning("sending audio failed: %s", e)
+            err = str(e).lower()
+            if "file is too big" in err or "too large" in err or \
+                    "must be smaller" in err:
+                await runner.status(
+                    "⚠️ Telegram refused the upload (file too large) — "
+                    "I can't send this one, sorry! 🙏")
+            else:
+                await runner.status(
+                    "⚠️ Telegram didn't accept the song — please try again.\n"
+                    f"<i>{esc(str(e)[-180:])}</i>")
     finally:
-        downloader.cleanup(path)
-        await runner.status_done()
+        if path:
+            downloader.cleanup(path)
+        if delivered:
+            await runner.status_done()
 
 
 # ---------------- Mini App (Telegram WebApp) ----------------
@@ -364,6 +477,11 @@ MINI_APP_FALLBACK = """<!DOCTYPE html>
   .card .a { color: var(--hint); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .d { color: var(--hint); font-size: 12px; }
   .card button { padding: 8px 12px; font-size: 13px; border-radius: 10px; }
+  #morewrap { text-align: center; padding: 4px 0 12px; }
+  #morewrap button {
+    padding: 10px 26px; font-size: 14px; background: var(--sec);
+    color: var(--accent); font-weight: 600;
+  }
   footer { text-align: center; color: var(--hint); font-size: 12px; padding: 14px 0 24px; }
 </style>
 </head>
@@ -418,35 +536,69 @@ MINI_APP_FALLBACK = """<!DOCTYPE html>
     try {
       const r = await api("/api/search", { initData: tg.initData || "", query: q });
       if (!r.tracks.length) { s("😕 Nothing found — try the exact title."); return; }
-      s(r.tracks.length + " results — tap a card");
-      resultsEl.innerHTML = "";
-      r.tracks.forEach(t => {
-        const card = document.createElement("div");
-        card.className = "card";
-
-        const info = document.createElement("div");
-        info.className = "info";
-        const t1 = document.createElement("div"); t1.className = "t";
-        t1.textContent = (t.index + 1) + ". " + t.title;
-        const t2 = document.createElement("div"); t2.className = "a";
-        t2.textContent = t.artist + (t.album ? " · " + t.album : "");
-        const t3 = document.createElement("div"); t3.className = "d";
-        t3.textContent = Math.floor(t.duration / 60) + ":" +
-          String(t.duration % 60).padStart(2, "0");
-        info.append(t1, t2, t3);
-
-        const btn = document.createElement("button");
-        btn.textContent = "♪ Get";
-        btn.onclick = () => send(t, card);
-
-        card.append(info, btn);
-        resultsEl.append(card);
-      });
+      r.tracks.forEach(t => resultsEl.append(makeCard(t)));
+      s(r.total + " results — tap a card");
+      updateMore(r);
     } catch (e) {
       s("⚠️ " + e.message);
     } finally {
       $("go").disabled = false;
     }
+  }
+
+  function makeCard(t) {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const info = document.createElement("div");
+    info.className = "info";
+    const t1 = document.createElement("div"); t1.className = "t";
+    t1.textContent = (t.index + 1) + ". " + t.title;
+    const t2 = document.createElement("div"); t2.className = "a";
+    t2.textContent = t.artist + (t.album ? " · " + t.album : "");
+    const t3 = document.createElement("div"); t3.className = "d";
+    t3.textContent = Math.floor(t.duration / 60) + ":" +
+      String(t.duration % 60).padStart(2, "0");
+    info.append(t1, t2, t3);
+
+    const btn = document.createElement("button");
+    btn.textContent = "♪ Get";
+    btn.onclick = () => send(t, card);
+
+    card.append(info, btn);
+    return card;
+  }
+
+  function updateMore(r) {
+    const old = document.getElementById("morewrap");
+    if (old) old.remove();
+    if (!r.hasMore) return;
+    const wrap = document.createElement("div");
+    wrap.id = "morewrap";
+    const btn = document.createElement("button");
+    btn.textContent = "➕ Load more";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "…";
+      s("🔎 Loading more…");
+      try {
+        const r2 = await api("/api/search", {
+          initData: tg.initData || "",
+          query: $("q").value.trim(),
+          loadMore: true,
+        });
+        r2.tracks.forEach(t => resultsEl.append(makeCard(t)));
+        s(r2.total + " results — tap a card");
+        updateMore(r2);
+        tg.HapticFeedback.impactOccurred("light");
+      } catch (e) {
+        s("⚠️ " + e.message);
+        btn.disabled = false;
+        btn.textContent = "➕ Load more";
+      }
+    };
+    wrap.append(btn);
+    resultsEl.append(wrap);
   }
 
   async function send(t, card) {
@@ -488,8 +640,10 @@ MINI_APP_FALLBACK = """<!DOCTYPE html>
 </html>"""
 
 
-def _remember_mini(uid: int, tracks: list[dict], query: str) -> None:
-    MINI_SESSIONS[uid] = {"tracks": tracks, "query": query, "ts": time.time()}
+def _remember_mini(uid: int, tracks: list[dict], query: str,
+                   has_more: bool = False) -> None:
+    MINI_SESSIONS[uid] = {"tracks": tracks, "query": query, "page": 1,
+                          "has_more": has_more, "ts": time.time()}
     while len(MINI_SESSIONS) > 100:
         oldest = min(MINI_SESSIONS, key=lambda k: MINI_SESSIONS[k]["ts"])
         del MINI_SESSIONS[oldest]
@@ -600,15 +754,42 @@ def _mini_handlers(app, aio_web):
         query = (body.get("query") or "").strip()[:120]
         if not query:
             return aio_web.json_response({"ok": False, "error": "no query"}, status=400)
+
+        def _out(tracks: list[dict], offset: int = 0) -> list[dict]:
+            return [{"index": offset + i, "title": t["title"],
+                     "artist": t["artist"], "album": t["album"],
+                     "duration": t["duration"]}
+                    for i, t in enumerate(tracks)]
+
+        # "Load more": fetch the next page and append it to the session.
+        session = MINI_SESSIONS.get(user["id"])
+        if body.get("loadMore"):
+            if not session or session.get("query") != query or not session.get("tracks"):
+                return aio_web.json_response(
+                    {"ok": False, "error": "search first"}, status=400)
+            page = session.get("page", 1)
+            added, has_more = await fetch_more(query, session["tracks"], page)
+            if added:
+                session["page"] = page + 1
+            session["has_more"] = has_more if added else False
+            session["ts"] = time.time()
+            return aio_web.json_response({
+                "ok": True,
+                "tracks": _out(added, len(session["tracks"]) - len(added)),
+                "total": len(session["tracks"]),
+                "hasMore": has_more if added else False,
+            })
+
         tracks = await music_service.search_all(query, config.RESULTS_LIMIT)
         if not tracks:
             return aio_web.json_response({"ok": True, "tracks": []})
-        _remember_mini(user["id"], tracks, query)
+        has_more = len(tracks) >= config.RESULTS_LIMIT
+        _remember_mini(user["id"], tracks, query, has_more)
         return aio_web.json_response({
             "ok": True,
-            "tracks": [{"index": i, "title": t["title"], "artist": t["artist"],
-                        "album": t["album"], "duration": t["duration"]}
-                       for i, t in enumerate(tracks)],
+            "tracks": _out(tracks),
+            "total": len(tracks),
+            "hasMore": has_more,
         })
 
     async def api_send(request):
