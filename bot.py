@@ -886,7 +886,7 @@ def _mini_handlers(app, aio_web):
         task.add_done_callback(_log_task)
         return aio_web.json_response({"ok": True})
 
-    return serve_app, api_search, api_send, api_diag
+    return serve_app, api_search, api_send, api_diag, api_diag_sources
 
 
 # ---------------- entry points ----------------
